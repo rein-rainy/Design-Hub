@@ -231,9 +231,60 @@ struct LeftSidebar: View {
     }
 }
 
+struct CommitDayGroup: Identifiable {
+    let id: String        // "yyyy-MM-dd"
+    let label: String     // "Commits on June 1, 2026"
+    let commits: [Commit] // newest first
+    var isExpanded: Bool = false
+}
+
+private let relativeFormatter: RelativeDateTimeFormatter = {
+    let f = RelativeDateTimeFormatter()
+    f.unitsStyle = .short
+    return f
+}()
+
+private let dayFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.dateStyle = .long
+    f.timeStyle = .none
+    return f
+}()
+
+private let dayKeyFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "yyyy-MM-dd"
+    return f
+}()
+
 struct RightSidebar: View {
+    @EnvironmentObject var versionStore: VersionStore
     @State private var canFadeTop: Bool = false
     @State private var canFadeBottom: Bool = false
+    private var project: Project? { versionStore.projects.first }
+
+    private var commits: [Commit] {
+        guard let p = project else { return [] }
+        return versionStore.commits(forProjectID: p.id)
+    }
+
+    private var dayGroups: [CommitDayGroup] {
+        let calendar = Calendar.current
+        var seen: [String: [Commit]] = [:]
+        for commit in commits {
+            let key = dayKeyFormatter.string(from: commit.timestamp)
+            seen[key, default: []].append(commit)
+        }
+        return seen
+            .map { key, group in
+                CommitDayGroup(
+                    id: key,
+                    label: "Commits on \(dayFormatter.string(from: group[0].timestamp))",
+                    commits: group.sorted { $0.timestamp > $1.timestamp }
+                )
+            }
+            .sorted { $0.id > $1.id }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -241,129 +292,142 @@ struct RightSidebar: View {
                 Text("Commits")
                     .font(.headline)
                 Spacer()
-                Text("14 Commits")
+                Text("\(commits.count) Commits")
                     .font(.footnote)
                     .foregroundColor(Color(NSColor.secondaryLabelColor))
             }
             .padding(15)
-            ScrollView(.vertical, showsIndicators: true) {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(alignment:.center,spacing: 10) {
-                        Circle()
-                            .stroke(Color(NSColor.secondaryLabelColor), lineWidth: 1)
-                            .frame(width: 8, height: 8)
-                        Text("Commits on May 21, 2026")
-                            .font(.body)
-                            .foregroundColor(Color(NSColor.secondaryLabelColor))
-                    }
-                    HStack(alignment:.top, spacing: 10) {
-                        Divider()
-                            .padding(.horizontal, 4)
-                        VStack(alignment: .leading, spacing: 14) {
-                            ForEach(0..<3, id: \.self) { _ in
-                                CommitItemView(time: "2 days ago", message: "Commit Message")
-                            }
-                            VStack(alignment: .leading, spacing: 8) {
-                                HStack(alignment:.center,spacing: 10) {
-                                    Image(systemName: "chevron.down")
-                                        .fontWeight(.semibold)
-                                        .imageScale(.small)
-                                        .foregroundColor(Color(NSColor.tertiaryLabelColor))
-                                        .frame(width: 8, height: 8)
-                                    Text("3 autosave versions")
-                                        .font(.body)
-                                        .foregroundColor(Color(NSColor.secondaryLabelColor))
-                                }
-                                HStack(alignment:.top, spacing: 10) {
-                                    Divider()
-                                        .padding(.horizontal, 4)
-                                    VStack(alignment: .leading, spacing: 14) {
-                                        ForEach(0..<3, id: \.self) { _ in
-                                            CommitItemView(time: "2 days ago", message: "Commit Message")
-                                        }
-                                    }
-                                    
-                                }
-                            }
+
+            if commits.isEmpty {
+                VStack(spacing: 6) {
+                    Text("No commits yet")
+                        .font(.body)
+                        .foregroundColor(Color(NSColor.secondaryLabelColor))
+                    Text("Save a file in Photoshop or Illustrator")
+                        .font(.callout)
+                        .foregroundColor(Color(NSColor.tertiaryLabelColor))
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView(.vertical, showsIndicators: true) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(dayGroups) { group in
+                            CommitDaySection(group: group)
                         }
                     }
-                    HStack(alignment:.center,spacing: 10) {
-                        Circle()
-                            .stroke(Color(NSColor.secondaryLabelColor), lineWidth: 1)
-                            .frame(width: 8, height: 8)
-                        Text("Commits on May 21, 2026")
-                            .font(.body)
-                            .foregroundColor(Color(NSColor.secondaryLabelColor))
+                    .padding(.horizontal, 15)
+                    .padding(.bottom, 50)
+                }
+                .onScrollGeometryChange(for: Bool.self) { geometry in
+                    geometry.contentOffset.y > 0.5
+                } action: { _, newValue in
+                    withAnimation(.easeInOut(duration: 0.2)) { canFadeTop = newValue }
+                }
+                .onScrollGeometryChange(for: Bool.self) { geometry in
+                    geometry.contentOffset.y + geometry.containerSize.height < geometry.contentSize.height - 0.5
+                } action: { _, newValue in
+                    withAnimation(.easeInOut(duration: 0.25)) { canFadeBottom = newValue }
+                }
+                .mask(
+                    VStack(spacing: 0) {
+                        LinearGradient(
+                            colors: canFadeTop ? [.clear, .black] : [.black, .black],
+                            startPoint: .top, endPoint: .bottom
+                        )
+                        .frame(height: 20)
+                        Color.black
+                        LinearGradient(
+                            colors: canFadeBottom ? [.black, .clear] : [.black, .black],
+                            startPoint: .top, endPoint: .bottom
+                        )
+                        .frame(height: 20)
                     }
-                    HStack(alignment:.top, spacing: 10) {
-                        Divider()
-                            .padding(.horizontal, 4)
-                        VStack(alignment: .leading, spacing: 14) {
-                            ForEach(0..<1, id: \.self) { _ in
-                                CommitItemView(time: "2 days ago", message: "Commit Message")
-                            }
-                        }
-                    }
-                }
-                .padding(.horizontal, 15)
-                .padding(.bottom, 50)
+                )
             }
-            .onScrollGeometryChange(for: Bool.self) { geometry in
-                geometry.contentOffset.y > 0.5
-            } action: { _, newValue in
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    canFadeTop = newValue
-                }
-            }
-            .onScrollGeometryChange(for: Bool.self) { geometry in
-                geometry.contentOffset.y + geometry.containerSize.height < geometry.contentSize.height - 0.5
-            } action: { _, newValue in
-                withAnimation(.easeInOut(duration: 0.25)) {
-                    canFadeBottom = newValue
-                }
-            }
-            .mask(
-                VStack(spacing: 0) {
-                    LinearGradient(
-                        colors: canFadeTop ? [.clear, .black] : [.black, .black],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                    .frame(height: 20)
-                    Color.black
-                    LinearGradient(
-                        colors: canFadeBottom ? [.black, .clear] : [.black, .black],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                    .frame(height: 20)
-                }
-            )
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 }
 
-struct CommitItemView: View {
-    let time: String
-    let message: String
+struct CommitDaySection: View {
+    let group: CommitDayGroup
 
     var body: some View {
-        HStack(alignment:.center) {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .center, spacing: 10) {
+                Circle()
+                    .stroke(Color(NSColor.secondaryLabelColor), lineWidth: 1)
+                    .frame(width: 8, height: 8)
+                Text(group.label)
+                    .font(.body)
+                    .foregroundColor(Color(NSColor.secondaryLabelColor))
+            }
+            HStack(alignment: .top, spacing: 10) {
+                Divider().padding(.horizontal, 4)
+                VStack(alignment: .leading, spacing: 14) {
+                    ForEach(group.commits) { commit in
+                        CommitItemView(commit: commit)
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct CommitItemView: View {
+    let commit: Commit
+    @State private var thumbnail: NSImage? = nil
+
+    private var timeLabel: String {
+        relativeFormatter.localizedString(for: commit.timestamp, relativeTo: Date())
+    }
+
+    var body: some View {
+        HStack(alignment: .center) {
             VStack(alignment: .leading, spacing: 5) {
-                Text(time)
+                Text(timeLabel)
                     .font(.callout)
                     .foregroundColor(Color(NSColor.secondaryLabelColor))
-                Text(message)
-                    .font(.body)
+                HStack(spacing: 6) {
+                    Text("\(commit.layerCount) layers")
+                        .font(.body)
+                    if let diff = commit.layerDiff, !diff.isEmpty {
+                        Text("+\(diff.added.count)")
+                            .foregroundColor(Color(NSColor.systemGreen))
+                        Text("-\(diff.removed.count)")
+                            .foregroundColor(Color(NSColor.systemRed))
+                    }
+                }
+                .font(.callout.monospacedDigit())
             }
-            Spacer()
-            RoundedRectangle(cornerRadius: 5)
-                .frame(width: 36, height: 36)
-                .foregroundColor(Color(NSColor.quinaryLabel))
+            Spacer(minLength: 8)
+            Group {
+                if let img = thumbnail {
+                    Image(nsImage: img)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: 36, height: 36)
+                        .clipShape(RoundedRectangle(cornerRadius: 5))
+                } else {
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(Color(NSColor.quinaryLabel))
+                        .frame(width: 36, height: 36)
+                        .overlay {
+                            if commit.hasBackup && !commit.hasThumbnail {
+                                ProgressView().scaleEffect(0.5)
+                            }
+                        }
+                }
+            }
+            .frame(width: 36, height: 36)
         }
         .padding(11)
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color(NSColor.separatorColor), lineWidth: 1))
+        .task(id: commit.thumbnailPath) {
+            guard let path = commit.thumbnailPath else { return }
+            thumbnail = NSImage(contentsOfFile: path)
+        }
     }
 }
 

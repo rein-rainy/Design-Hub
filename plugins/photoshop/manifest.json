@@ -1,0 +1,20 @@
+{
+  "id": "com.designhub.photoshop",
+  "name": "Design Hub",
+  "version": "1.0.0",
+  "main": "index.html",
+  "manifestVersion": 4,
+  "host": {
+    "app": "PS",
+    "minVersion": "22.0"
+  },
+  "entrypoints": [
+    {
+      "type": "panel",
+      "id": "mainPanel",
+      "label": { "default": "Design Hub" },
+      "minimumSize": { "width": 200, "height": 100 },
+      "maximumSize": { "width": 2000, "height": 2000 }
+    }
+  ]
+}
