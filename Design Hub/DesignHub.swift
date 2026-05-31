@@ -17,5 +17,13 @@ struct DesignHubApp: App {
                     versionStore.subscribe(to: pluginBridge)
                 }
         }
+        .commands {
+            CommandMenu("Debug") {
+                Button("Show Commit Panel") {
+                    CommitPanelController.shared.show(rootView: CommitPanelPlaceholder())
+                }
+                .keyboardShortcut("k", modifiers: [.command, .shift])
+            }
+        }
     }
 }
