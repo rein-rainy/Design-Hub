@@ -7,6 +7,7 @@ struct DesignHubApp: App {
         (try? VersionStore.makeDefault()) ?? VersionStore(db: try! Database(path: ":memory:"))
     }()
     @StateObject private var directoryGroupStore = DirectoryGroupStore()
+    @StateObject private var liveDocumentStore = LiveDocumentStore()
     @State private var coordinator = AppCoordinator()
 
     var body: some Scene {
@@ -15,10 +16,13 @@ struct DesignHubApp: App {
                 .environmentObject(pluginBridge)
                 .environmentObject(versionStore)
                 .environmentObject(directoryGroupStore)
+                .environmentObject(liveDocumentStore)
                 .task {
+                    AutoSaveNotifier.requestAuthorization()
                     pluginBridge.start()
                     versionStore.subscribe(to: pluginBridge)
                     versionStore.subscribeToDebugSimulation()
+                    liveDocumentStore.subscribe(to: pluginBridge)
                     coordinator.bind(to: versionStore)
                 }
         }

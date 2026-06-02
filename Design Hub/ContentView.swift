@@ -11,17 +11,20 @@ enum ViewMode: String, CaseIterable, Identifiable {
 
 struct ContentView: View {
     @EnvironmentObject var directoryStore: DirectoryGroupStore
+    @EnvironmentObject var versionStore: VersionStore
     @State private var isInspectorPresented: Bool = true
     @State private var selectedMode: ViewMode = .single
     @State private var canvasScale: CGFloat = 1.0
     @State private var selectedCommit: Commit? = nil
+    @State private var restoredFileURL: URL? = nil
+    @State private var showRestoreError: Bool = false
 
     var body: some View {
         NavigationSplitView {
             LeftSidebar()
                 .navigationSplitViewColumnWidth(min: 210, ideal: 220, max: 230)
         } detail: {
-            CanvasView(scale: $canvasScale, selectedCommit: selectedCommit)
+            CanvasView(scale: $canvasScale, selectedMode: selectedMode, selectedCommit: selectedCommit)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .overlay(alignment: .bottomLeading) {
                     ViewModeSwitcher(selectedMode: $selectedMode)
@@ -40,6 +43,16 @@ struct ContentView: View {
                         .inspectorColumnWidth(min: 240, ideal: 300, max: 400)
                 }
                 .toolbar {
+                    if let commit = selectedCommit {
+                        ToolbarItem(placement: .primaryAction) {
+                            Button {
+                                restore(commit)
+                            } label: {
+                                Label("Restore", systemImage: "arrow.uturn.backward")
+                            }
+                            .help("Restore this version as a new file next to the original")
+                        }
+                    }
                     ToolbarItem(placement: .primaryAction) {
                         Button {
                             isInspectorPresented.toggle()
@@ -53,42 +66,146 @@ struct ContentView: View {
         .frame(minWidth: 640, minHeight: 400)
         .onChange(of: directoryStore.selectedFile) { _ in
             selectedCommit = nil
+            selectedMode = .single
+        }
+        .alert("Restore Failed", isPresented: $showRestoreError) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("This version could not be restored. The backup or original file may be missing, or the file was never saved to disk.")
+        }
+    }
+
+    private func restore(_ commit: Commit) {
+        if let url = versionStore.restore(commit: commit) {
+            restoredFileURL = url
+            // Reveal the freshly restored file in Finder so it's easy to find.
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } else {
+            showRestoreError = true
         }
     }
 }
 
 struct CanvasView: View {
     @EnvironmentObject var directoryStore: DirectoryGroupStore
+    @EnvironmentObject var versionStore: VersionStore
     @Binding var scale: CGFloat
+    let selectedMode: ViewMode
     let selectedCommit: Commit?
     @State private var offset: CGSize = .zero
     @GestureState private var gestureScale: CGFloat = 1.0
     @GestureState private var gestureOffset: CGSize = .zero
     @State private var displayImage: NSImage? = nil
+    // Slider-compare layers: base = latest commit, top = sidebar-selected commit.
+    @State private var sliderBaseImage: NSImage? = nil
+    @State private var sliderTopImage: NSImage? = nil
+    // Split position as a fraction (0…1) of the canvas width.
+    @State private var split: CGFloat = 0.5
+    @State private var dragStartSplit: CGFloat? = nil
+
+    private func resolvedPath(_ path: String) -> String {
+        if path.hasPrefix("file://"), let url = URL(string: path) {
+            return url.resolvingSymlinksInPath().path
+        }
+        return URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+    }
+
+    private var project: Project? {
+        guard let file = directoryStore.selectedFile else { return nil }
+        let target = resolvedPath(file.path)
+        return versionStore.projects.first { resolvedPath($0.path) == target }
+    }
+
+    /// Newest commit for the current project (commits are stored newest-first).
+    private var latestCommit: Commit? {
+        guard let p = project else { return nil }
+        return versionStore.commits(forProjectID: p.id).first
+    }
+
+    /// True once slider mode is active and both images have loaded.
+    private var isSliding: Bool {
+        selectedMode == .slider && sliderBaseImage != nil && sliderTopImage != nil
+    }
+
+    /// True once side-by-side compare mode is active and both images have loaded.
+    private var isComparing: Bool {
+        selectedMode == .compare && sliderBaseImage != nil && sliderTopImage != nil
+    }
 
     private var taskID: String {
-        if let id = selectedCommit?.id { return "commit:\(id)" }
-        if let path = directoryStore.selectedFile?.path { return "file:\(path)" }
-        return "none"
+        let latest = latestCommit?.id ?? "-"
+        let selected = selectedCommit?.id ?? "-"
+        let file = directoryStore.selectedFile?.path ?? "-"
+        return "\(selectedMode.rawValue)|latest:\(latest)|sel:\(selected)|file:\(file)"
+    }
+
+    /// One image at canvas size, no transform (transform is applied to the whole
+    /// comparison assembly so the split line and clip can ride along with it).
+    @ViewBuilder
+    private func imageContent(_ img: NSImage) -> some View {
+        Image(nsImage: img)
+            .resizable()
+            .scaledToFit()
+            .padding(20)
     }
 
     var body: some View {
         GeometryReader { geometry in
+            let w = geometry.size.width
+            let h = geometry.size.height
+            // Split position in the image's own (untransformed) coordinate space.
+            let localSplitX = max(0, min(w, split * w))
+            let effectiveScale = scale * gestureScale
+            let effectiveOffsetX = offset.width + gestureOffset.width
+            let effectiveOffsetY = offset.height + gestureOffset.height
+            // Where that split lands on screen once the assembly is scaled (about
+            // the center) and offset — so the handle tracks the image content.
+            let screenSplitX = (localSplitX - w / 2) * effectiveScale + w / 2 + effectiveOffsetX
             Color.clear
                 .overlay {
-                    ZStack {
-                        if let img = displayImage {
-                            Image(nsImage: img)
-                                .resizable()
-                                .scaledToFit()
-                                .padding(20)
-                                .scaleEffect(scale * gestureScale)
-                                .offset(
-                                    x: offset.width + gestureOffset.width,
-                                    y: offset.height + gestureOffset.height
-                                )
+                    Group {
+                        if isSliding, let base = sliderBaseImage, let top = sliderTopImage {
+                            ZStack {
+                                // Left half: selected commit, clipped to [0, splitX].
+                                imageContent(top)
+                                    .frame(width: w, height: h)
+                                    .mask(alignment: .leading) {
+                                        Rectangle().frame(width: localSplitX)
+                                    }
+                                // Right half: latest commit, clipped to [splitX, width].
+                                imageContent(base)
+                                    .frame(width: w, height: h)
+                                    .mask(alignment: .trailing) {
+                                        Rectangle().frame(width: w - localSplitX)
+                                    }
+                            }
+                            .frame(width: w, height: h)
+                        } else if isComparing, let base = sliderBaseImage, let top = sliderTopImage {
+                            // Side by side: selected commit (left) | latest commit (right).
+                            HStack(spacing: 0) {
+                                imageContent(top)
+                                    .frame(width: w / 2, height: h)
+                                imageContent(base)
+                                    .frame(width: w / 2, height: h)
+                            }
+                            .frame(width: w, height: h)
+                        } else if let img = displayImage {
+                            imageContent(img)
                         }
-
+                    }
+                    .scaleEffect(effectiveScale)
+                    .offset(x: effectiveOffsetX, y: effectiveOffsetY)
+                }
+                .overlay {
+                    if isSliding {
+                        SliderHandle(
+                            screenX: screenSplitX,
+                            canvasWidth: w,
+                            canvasHeight: h,
+                            scale: effectiveScale,
+                            split: $split,
+                            dragStartSplit: $dragStartSplit
+                        )
                     }
                 }
                 .contentShape(Rectangle())
@@ -137,6 +254,26 @@ struct CanvasView: View {
             height: canvasSize.height * screenScale
         )
 
+        // Slider / Compare modes: latest commit vs the sidebar-selected one.
+        if selectedMode == .slider || selectedMode == .compare,
+           let latest = latestCommit, let latestPath = latest.backupPath,
+           let selected = selectedCommit, let selectedPath = selected.backupPath {
+            async let base = ThumbnailGenerator.renderHiRes(
+                from: URL(fileURLWithPath: latestPath), size: renderSize)
+            async let top = ThumbnailGenerator.renderHiRes(
+                from: URL(fileURLWithPath: selectedPath), size: renderSize)
+            let (baseImage, topImage) = await (base, top)
+            guard !Task.isCancelled else { return }
+            sliderBaseImage = baseImage
+            sliderTopImage = topImage
+            split = 0.5
+            return
+        }
+
+        // Single-image modes (or slider with nothing to compare yet).
+        sliderBaseImage = nil
+        sliderTopImage = nil
+
         if let commit = selectedCommit {
             guard let backupPath = commit.backupPath else { return }
             let fileURL = URL(fileURLWithPath: backupPath)
@@ -152,6 +289,51 @@ struct CanvasView: View {
         } else {
             displayImage = nil
         }
+    }
+}
+
+/// The draggable vertical divider for slider-compare mode: a thin line with a
+/// round grab handle at its center. Dragging anywhere on the strip moves the split.
+struct SliderHandle: View {
+    /// Screen-space x where the split currently lands (already transformed).
+    let screenX: CGFloat
+    let canvasWidth: CGFloat
+    let canvasHeight: CGFloat
+    /// Effective zoom factor, so a screen-space drag maps back to local split.
+    let scale: CGFloat
+    @Binding var split: CGFloat
+    @Binding var dragStartSplit: CGFloat?
+
+    private let hitWidth: CGFloat = 44
+
+    var body: some View {
+        ZStack {
+            Rectangle()
+                .fill(Color.white)
+                .frame(width: 2)
+            Circle()
+                .fill(Color.white)
+                .frame(width: 34, height: 34)
+                .overlay {
+                    Image(systemName: "arrow.left.and.right")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Color(NSColor.darkGray))
+                }
+        }
+        .frame(width: hitWidth, height: canvasHeight)
+        .contentShape(Rectangle())
+        .position(x: screenX, y: canvasHeight / 2)
+        .gesture(
+            DragGesture()
+                .onChanged { value in
+                    let start = dragStartSplit ?? split
+                    if dragStartSplit == nil { dragStartSplit = split }
+                    // Screen drag → local fraction: undo the zoom factor.
+                    let delta = value.translation.width / max(canvasWidth * scale, 1)
+                    split = min(1, max(0, start + delta))
+                }
+                .onEnded { _ in dragStartSplit = nil }
+        )
     }
 }
 
@@ -258,7 +440,9 @@ struct ViewModeSwitcher: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(Color(NSColor.secondaryLabelColor))
+                .foregroundStyle(mode == selectedMode
+                    ? Color(NSColor.labelColor)
+                    : Color(NSColor.secondaryLabelColor))
             }
         }
         .frame(height: 22)
@@ -359,29 +543,9 @@ struct LeftSidebar: View {
     }
 }
 
-struct CommitDayGroup: Identifiable {
-    let id: String        // "yyyy-MM-dd"
-    let label: String     // "Commits on June 1, 2026"
-    let commits: [Commit] // newest first
-    var isExpanded: Bool = false
-}
-
 private let relativeFormatter: RelativeDateTimeFormatter = {
     let f = RelativeDateTimeFormatter()
     f.unitsStyle = .short
-    return f
-}()
-
-private let dayFormatter: DateFormatter = {
-    let f = DateFormatter()
-    f.dateStyle = .long
-    f.timeStyle = .none
-    return f
-}()
-
-private let dayKeyFormatter: DateFormatter = {
-    let f = DateFormatter()
-    f.dateFormat = "yyyy-MM-dd"
     return f
 }()
 
@@ -421,20 +585,7 @@ struct RightSidebar: View {
     }
 
     private var dayGroups: [CommitDayGroup] {
-        var seen: [String: [Commit]] = [:]
-        for commit in commits {
-            let key = dayKeyFormatter.string(from: commit.timestamp)
-            seen[key, default: []].append(commit)
-        }
-        return seen
-            .map { key, group in
-                CommitDayGroup(
-                    id: key,
-                    label: "Commits on \(dayFormatter.string(from: group[0].timestamp))",
-                    commits: group.sorted { $0.timestamp > $1.timestamp }
-                )
-            }
-            .sorted { $0.id > $1.id }
+        CommitGrouping.byDay(commits)
     }
 
     var body: some View {
@@ -513,45 +664,13 @@ struct RightSidebar: View {
 }
 
 // Chunks a flat commit list into user commits and consecutive autosave groups.
-private enum CommitListItem: Identifiable {
-    case single(Commit)
-    case autosaveGroup(id: String, commits: [Commit])
-
-    var id: String {
-        switch self {
-        case .single(let c): return c.id
-        case .autosaveGroup(let gid, _): return "g-\(gid)"
-        }
-    }
-}
-
-private func chunkCommits(_ commits: [Commit]) -> [CommitListItem] {
-    var result: [CommitListItem] = []
-    var buffer: [Commit] = []
-    for commit in commits {
-        if commit.isAutosave {
-            buffer.append(commit)
-        } else {
-            if !buffer.isEmpty {
-                result.append(.autosaveGroup(id: buffer[0].id, commits: buffer))
-                buffer = []
-            }
-            result.append(.single(commit))
-        }
-    }
-    if !buffer.isEmpty {
-        result.append(.autosaveGroup(id: buffer[0].id, commits: buffer))
-    }
-    return result
-}
-
 struct CommitDaySection: View {
     let group: CommitDayGroup
     @Binding var selectedCommit: Commit?
     let autoSaveNumbers: [String: Int]
     @State private var expandedGroups: Set<String> = []
 
-    private var chunked: [CommitListItem] { chunkCommits(group.commits) }
+    private var chunked: [CommitListItem] { CommitGrouping.chunkByAutosave(group.commits) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -717,25 +836,69 @@ struct CommitItemView: View {
     }
 }
 
+/// Per-day activity scores + relative (quartile) level thresholds for the heatmap.
+///
+/// Score for a day = Σ over that day's commits of (added + removed layers). This is a
+/// *delta* metric, so it doesn't depend on how large the file happens to be — only on
+/// how much structurally changed. Levels are assigned by quartile over all active days,
+/// so the color scale adapts to the user's own activity instead of fixed thresholds.
+private struct HeatmapData {
+    /// startOfDay → total layer changes that day (only days with score > 0 are present).
+    let scores: [Date: Int]
+    /// Quartile cut points over all nonzero daily scores (25th / 50th / 75th percentile).
+    let q1: Int
+    let q2: Int
+    let q3: Int
+
+    /// 0 = no activity (gray); 1…4 = increasing green tiers.
+    func level(forDay day: Date, calendar: Calendar) -> Int {
+        let s = scores[calendar.startOfDay(for: day)] ?? 0
+        guard s > 0 else { return 0 }
+        if s <= q1 { return 1 }
+        if s <= q2 { return 2 }
+        if s <= q3 { return 3 }
+        return 4
+    }
+}
+
 struct HeatmapSection: View {
+    @EnvironmentObject var versionStore: VersionStore
+
+    /// Anchor inside the currently displayed month. Defaults to today's month.
+    @State private var monthAnchor: Date = Date()
+
+    private let calendar = Calendar.current
+
+    private static let monthFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MMMM, yyyy"
+        return f
+    }()
+
     var body: some View {
+        let data = buildHeatmapData()
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .center) {
-                Text("May, 2026")
+                Text(Self.monthFormatter.string(from: monthAnchor))
                     .font(.body)
                 Spacer()
-                HStack(alignment:.center) {
-                    Image(systemName: "chevron.up")
-                        .fontWeight(.bold)
-                        .foregroundColor(Color(NSColor.secondaryLabelColor))
-                        .imageScale(.small)
-                    Image(systemName: "chevron.down")
-                        .fontWeight(.bold)
-                        .foregroundColor(Color(NSColor.secondaryLabelColor))
-                        .imageScale(.small)
+                HStack(alignment: .center) {
+                    Button { shiftMonth(by: -1) } label: {
+                        Image(systemName: "chevron.up")
+                            .fontWeight(.bold)
+                            .foregroundColor(Color(NSColor.secondaryLabelColor))
+                            .imageScale(.small)
+                    }
+                    Button { shiftMonth(by: 1) } label: {
+                        Image(systemName: "chevron.down")
+                            .fontWeight(.bold)
+                            .foregroundColor(Color(NSColor.secondaryLabelColor))
+                            .imageScale(.small)
+                    }
                 }
+                .buttonStyle(.plain)
             }
-            VStack() {
+            VStack {
                 HStack(spacing: 5) {
                     ForEach(Array(["S", "M", "T", "W", "T", "F", "S"].enumerated()), id: \.offset) { _, day in
                         Text(day)
@@ -747,12 +910,10 @@ struct HeatmapSection: View {
                 }
 
                 VStack(spacing: 5) {
-                    ForEach(0..<5) { _ in
+                    ForEach(Array(monthWeeks().enumerated()), id: \.offset) { _, week in
                         HStack(spacing: 5) {
-                            ForEach(0..<7) { _ in
-                                RoundedRectangle(cornerRadius: 4)
-                                    .fill(Color(NSColor.quaternaryLabelColor))
-                                    .aspectRatio(1, contentMode: .fit)
+                            ForEach(Array(week.enumerated()), id: \.offset) { _, day in
+                                cell(for: day, data: data)
                             }
                         }
                     }
@@ -761,6 +922,98 @@ struct HeatmapSection: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
+
+    /// DEBUG: paint every day a random tier instead of the computed activity level.
+    private static let debugRandomColors = false
+
+    private func cell(for day: Date, data: HeatmapData) -> some View {
+        let level = Self.debugRandomColors
+            ? debugLevel(for: day)
+            : data.level(forDay: day, calendar: calendar)
+        return RoundedRectangle(cornerRadius: 4)
+            .fill(color(forLevel: level))
+            .aspectRatio(1, contentMode: .fit)
+    }
+
+    /// Deterministic 0…4 level seeded by the day, so colors stay stable across redraws.
+    /// Uses splitmix64 mixing so consecutive days scatter instead of trending in order.
+    private func debugLevel(for day: Date) -> Int {
+        let dayNumber = Int64(day.timeIntervalSince1970 / 86400)
+        var z = UInt64(bitPattern: dayNumber) &+ 0x9E3779B97F4A7C15
+        z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+        z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+        z = z ^ (z >> 31)
+        return Int(z % 5)
+    }
+
+    /// green quaternary → primary as the level rises; level 0 is the empty gray.
+    private func color(forLevel level: Int) -> Color {
+        switch level {
+        case 1: return Color(NSColor.systemGreen).opacity(0.25)
+        case 2: return Color(NSColor.systemGreen).opacity(0.5)
+        case 3: return Color(NSColor.systemGreen).opacity(0.75)
+        case 4: return Color(NSColor.systemGreen)
+        default: return Color(NSColor.quaternaryLabelColor)
+        }
+    }
+
+    // MARK: - Month grid
+
+    private func shiftMonth(by months: Int) {
+        if let next = calendar.date(byAdding: .month, value: months, to: monthAnchor) {
+            monthAnchor = next
+        }
+    }
+
+    /// Fixed 5×7 grid for the displayed month: 35 consecutive days starting from the 1st.
+    /// Not a calendar-accurate month layout (no weekday alignment / blank slots) — the
+    /// shape is always 5 rows of 7 so the sidebar block never changes size.
+    private func monthWeeks() -> [[Date]] {
+        guard let firstOfMonth = calendar.date(from: calendar.dateComponents([.year, .month], from: monthAnchor))
+        else { return [] }
+
+        let days: [Date] = (0..<35).compactMap {
+            calendar.date(byAdding: .day, value: $0, to: firstOfMonth)
+        }
+        return stride(from: 0, to: days.count, by: 7).map {
+            Array(days[$0..<min($0 + 7, days.count)])
+        }
+    }
+
+    // MARK: - Data
+
+    private func buildHeatmapData() -> HeatmapData {
+        var scores: [Date: Int] = [:]
+        for commits in versionStore.commitCache.values {
+            for commit in commits {
+                let amount = changeAmount(commit)
+                guard amount > 0 else { continue }
+                let day = calendar.startOfDay(for: commit.timestamp)
+                scores[day, default: 0] += amount
+            }
+        }
+        let sorted = scores.values.sorted()
+        return HeatmapData(scores: scores,
+                           q1: percentile(sorted, 0.25),
+                           q2: percentile(sorted, 0.50),
+                           q3: percentile(sorted, 0.75))
+    }
+
+    /// Layer changes a commit represents. The oldest commit of a project has no previous
+    /// snapshot to diff against (layerDiff == nil), so we count its whole tree as additions
+    /// — file creation is real work.
+    private func changeAmount(_ commit: Commit) -> Int {
+        if let diff = commit.layerDiff {
+            return diff.added.count + diff.removed.count
+        }
+        return commit.layerCount
+    }
+
+    private func percentile(_ sorted: [Int], _ p: Double) -> Int {
+        guard !sorted.isEmpty else { return 0 }
+        let idx = Int((Double(sorted.count - 1) * p).rounded())
+        return sorted[idx]
+    }
 }
 
 struct DirectoryTreeSection: View {
@@ -768,6 +1021,9 @@ struct DirectoryTreeSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
+            // Live group: files currently open in Photoshop / Illustrator.
+            // Renders nothing (no header, no gap) when no document is open.
+            LiveGroupSection()
             ForEach(directoryStore.groups) { group in
                 DirectoryGroupSection(
                     group: group,
@@ -776,6 +1032,111 @@ struct DirectoryTreeSection: View {
                 )
             }
         }
+    }
+}
+
+/// The "Now Editing" group pinned at the top of the sidebar. Lists the documents
+/// currently open in the connected design apps and lets you select one — selecting
+/// a saved file mirrors a normal directory selection so the canvas + commit list
+/// update. Hidden entirely while nothing is open.
+struct LiveGroupSection: View {
+    @EnvironmentObject var liveStore: LiveDocumentStore
+
+    var body: some View {
+        if !liveStore.documents.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 7) {
+                    LivePulseDot()
+                    Text("Now Editing")
+                        .font(.body)
+                        .foregroundColor(Color(NSColor.secondaryLabelColor))
+                }
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(liveStore.documents) { doc in
+                        LiveDocumentRow(doc: doc)
+                    }
+                }
+            }
+            .transition(.opacity)
+            .animation(.easeInOut(duration: 0.2), value: liveStore.documents)
+        }
+    }
+}
+
+/// Small green "live" indicator with a gentle pulse.
+struct LivePulseDot: View {
+    @State private var pulsing = false
+
+    var body: some View {
+        Circle()
+            .fill(Color(NSColor.systemGreen))
+            .frame(width: 7, height: 7)
+            .opacity(pulsing ? 0.4 : 1)
+            .animation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true), value: pulsing)
+            .onAppear { pulsing = true }
+    }
+}
+
+struct LiveDocumentRow: View {
+    @EnvironmentObject var directoryStore: DirectoryGroupStore
+    let doc: LiveDocument
+    @State private var icon: NSImage? = nil
+
+    private var isSelected: Bool {
+        guard let url = doc.url else { return false }
+        return directoryStore.selectedFile?.path == url.path
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 4) {
+            Group {
+                if let icon {
+                    Image(nsImage: icon).resizable()
+                } else {
+                    Color.clear
+                }
+            }
+            .frame(width: 16, height: 16)
+            Text(doc.name)
+                .font(.callout)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .foregroundStyle(isSelected ? Color.accentColor : Color(NSColor.labelColor))
+            Spacer(minLength: 4)
+        }
+        .padding(.vertical, 2)
+        .padding(.horizontal, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .opacity(doc.hasFile ? 1 : 0.55)
+        .overlay(
+            RowClickCatcher { _ in
+                // Only saved documents have a file on disk to preview/select.
+                if let url = doc.url { directoryStore.selectedFile = url }
+            }
+        )
+        .help(doc.hasFile ? doc.path : "\(doc.name) — unsaved")
+        .task(id: doc.id) {
+            icon = await LiveDocumentRow.loadIcon(for: doc)
+        }
+    }
+
+    /// File icon for saved docs (shows the .psd/.ai document icon); a generic app
+    /// icon for unsaved ones, which have no file on disk to read an icon from.
+    private static func loadIcon(for doc: LiveDocument) async -> NSImage {
+        if let url = doc.url {
+            let path = url.path
+            return await Task.detached(priority: .userInitiated) {
+                NSWorkspace.shared.icon(forFile: path)
+            }.value
+        }
+        let bundleID = doc.app == .photoshop ? "com.adobe.Photoshop" : "com.adobe.illustrator"
+        return await Task.detached(priority: .userInitiated) {
+            if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
+                return NSWorkspace.shared.icon(forFile: appURL.path)
+            }
+            return NSWorkspace.shared.icon(for: .data)
+        }.value
     }
 }
 
@@ -951,26 +1312,6 @@ private nonisolated func directoryHasVisibleContent(_ url: URL) -> Bool {
         return true
     }
     return false
-}
-
-/// Caches file icons for the lifetime of the app. Keyed by *type* (extension for
-/// files, a single key for folders) so a directory full of same-type design files
-/// only triggers one `NSWorkspace` lookup instead of one per file.
-@MainActor
-final class IconCache {
-    static let shared = IconCache()
-    private var cache: [String: NSImage] = [:]
-
-    func icon(for item: DirectoryItem) async -> NSImage {
-        let key = item.isDirectory ? "/dir" : item.url.pathExtension.lowercased()
-        if let cached = cache[key] { return cached }
-        let path = item.path
-        let image = await Task.detached(priority: .userInitiated) {
-            NSWorkspace.shared.icon(forFile: path)
-        }.value
-        cache[key] = image
-        return image
-    }
 }
 
 /// Handles row clicks via AppKit so a single click fires *immediately* instead of

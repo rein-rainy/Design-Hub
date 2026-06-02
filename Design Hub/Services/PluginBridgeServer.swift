@@ -3,7 +3,7 @@ import Network
 import Combine
 
 // WebSocket server that listens on localhost:49152 for connections from the
-// Photoshop and Illustrator UXP plugins.
+// Photoshop (UXP) and Illustrator (CEP) plugins.
 
 @MainActor
 final class PluginBridgeServer: ObservableObject {

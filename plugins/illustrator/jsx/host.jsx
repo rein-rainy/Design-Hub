@@ -81,6 +81,43 @@ function dhSnapshot() {
         + '}';
 }
 
+// Auto-save path: flush in-memory edits to disk first (so the macOS app sees
+// real byte changes), then return the snapshot. Untitled docs (no file on disk)
+// are snapshotted without saving — there is nowhere to save them silently.
+function dhSaveAndSnapshot() {
+    if (app.documents.length === 0) return "";
+    var doc = app.activeDocument;
+
+    var path = "";
+    try { path = doc.fullName.fsName; } catch (e) { path = ""; }
+
+    if (path !== "") {
+        var dirty = false;
+        try { dirty = (doc.saved === false); } catch (e2) {}
+        if (dirty) {
+            try { doc.save(); } catch (e3) {}
+        }
+    }
+
+    return dhSnapshot();
+}
+
+// All currently-open documents (path + name), so the panel can detect which
+// documents were closed by diffing against the previous set. Handles closing one
+// of several docs and switching the active doc — cases dhSaveState alone misses.
+function dhOpenDocs() {
+    var out = [];
+    try {
+        for (var i = 0; i < app.documents.length; i++) {
+            var d = app.documents[i];
+            var p = "";
+            try { p = d.fullName.fsName; } catch (e) { p = ""; }
+            out.push('{"path":"' + dhEscape(p) + '","name":"' + dhEscape(d.name) + '"}');
+        }
+    } catch (e2) {}
+    return '[' + out.join(',') + ']';
+}
+
 // Lightweight state used by the panel to detect open / save / close transitions.
 function dhSaveState() {
     if (app.documents.length === 0) {

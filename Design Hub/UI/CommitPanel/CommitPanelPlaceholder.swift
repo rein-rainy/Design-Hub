@@ -12,9 +12,9 @@ struct CommitPanelPlaceholder: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("ファイルが保存されました")
+            Text("File saved")
                 .font(.headline)
-            TextField("コミットメッセージを入力", text: $commitMessage)
+            TextField("Enter commit message", text: $commitMessage)
                 .font(.body)
                 .textFieldStyle(.plain)
                 .focused($isFocused)
@@ -54,7 +54,7 @@ struct CommitPanelPlaceholder: View {
                 Button {
                     onCancel()
                 } label: {
-                    Text("キャンセル")
+                    Text("Cancel")
                         .font(.body)
                         .foregroundStyle(Color(NSColor.labelColor))
                         .padding(.horizontal, 20)
@@ -69,7 +69,7 @@ struct CommitPanelPlaceholder: View {
                 Button {
                     onCommit(commitMessage)
                 } label: {
-                    Text("コミット")
+                    Text("Commit")
                         .font(.body)
                         .foregroundStyle(colorScheme == .dark ? .black : .white)
                         .padding(.horizontal, 20)

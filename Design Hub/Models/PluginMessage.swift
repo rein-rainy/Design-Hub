@@ -1,6 +1,6 @@
 import Foundation
 
-// Matches the JSON protocol sent by the Photoshop and Illustrator UXP plugins.
+// Matches the JSON protocol sent by the Photoshop (UXP) and Illustrator (CEP) plugins.
 
 struct PluginMessage: Codable, Equatable {
     let version: Int

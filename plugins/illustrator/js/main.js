@@ -82,7 +82,8 @@ bridge.setStatusHandler(function (status) {
 });
 
 bridge.setMessageHandler(function (msg) {
-  if (msg && msg.type === 'request_snapshot') sendSnapshot('snapshot_requested');
+  // Auto-save: save the document to disk first, then snapshot.
+  if (msg && msg.type === 'request_snapshot') sendSnapshot('snapshot_requested', 'dhSaveAndSnapshot');
 });
 
 // ── Snapshot ─────────────────────────────────────────────────────────────────
@@ -97,13 +98,20 @@ function envelope(eventType, payload) {
   };
 }
 
-function sendSnapshot(eventType) {
-  cs.evalScript('dhSnapshot()', function (res) {
+function sendSnapshot(eventType, hostFn) {
+  cs.evalScript((hostFn || 'dhSnapshot') + '()', function (res) {
     if (!res || res === 'EvalScript error.' || res === 'undefined') return;
     var payload;
     try { payload = JSON.parse(res); } catch (e) { return; }
     bridge.send(envelope(eventType, payload));
     lastEvent.textContent = eventType + ' · ' + new Date().toLocaleTimeString();
+    // After a programmatic auto-save the doc is now clean; sync the poll state
+    // so the next poll doesn't read it as a user-initiated dirty→saved save.
+    if (hostFn === 'dhSaveAndSnapshot') {
+      lastSaved = true;
+      if (payload.path) lastPath = payload.path;
+      if (payload.name) lastName = payload.name;
+    }
   });
 }
 
@@ -114,7 +122,16 @@ var lastPath  = '';
 var lastSaved = true;
 var lastName  = '';
 
+// Snapshot of every open document, used to emit document_closed for any that
+// disappear — covers closing one of several docs and switching the active doc.
+var knownDocs = []; // [{ path, name }]
+
+function docKey(d) {
+  return d.path !== '' ? d.path : ('untitled:' + d.name);
+}
+
 function poll() {
+  // (1) Active-doc open/save detection (drives the commit panel).
   cs.evalScript('dhSaveState()', function (res) {
     var st;
     try { st = JSON.parse(res); } catch (e) { return; }
@@ -134,19 +151,34 @@ function poll() {
       lastSaved = st.saved;
       lastName = st.name;
     } else {
-      if (lastOpen) {
-        bridge.send(envelope('document_closed', {
-          path: lastPath, name: lastName,
-          layerCount: 0, topLevelLayerCount: 0, layerTree: [],
-          artboardCount: 0, artboardNames: []
-        }));
-        lastEvent.textContent = 'document_closed · ' + new Date().toLocaleTimeString();
-      }
       lastOpen = false;
       lastPath = '';
       lastSaved = true;
       lastName = '';
     }
+  });
+
+  // (2) Reconcile the full open set so closed docs leave "Now Editing".
+  cs.evalScript('dhOpenDocs()', function (res) {
+    var docs;
+    try { docs = JSON.parse(res); } catch (e) { return; }
+
+    for (var i = 0; i < knownDocs.length; i++) {
+      var prev = knownDocs[i];
+      var stillOpen = false;
+      for (var j = 0; j < docs.length; j++) {
+        if (docKey(docs[j]) === docKey(prev)) { stillOpen = true; break; }
+      }
+      if (!stillOpen) {
+        bridge.send(envelope('document_closed', {
+          path: prev.path, name: prev.name,
+          layerCount: 0, topLevelLayerCount: 0, layerTree: [],
+          artboardCount: 0, artboardNames: []
+        }));
+        lastEvent.textContent = 'document_closed · ' + new Date().toLocaleTimeString();
+      }
+    }
+    knownDocs = docs;
   });
 }
 
