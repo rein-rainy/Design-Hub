@@ -836,31 +836,6 @@ struct CommitItemView: View {
     }
 }
 
-/// Per-day activity scores + relative (quartile) level thresholds for the heatmap.
-///
-/// Score for a day = Σ over that day's commits of (added + removed layers). This is a
-/// *delta* metric, so it doesn't depend on how large the file happens to be — only on
-/// how much structurally changed. Levels are assigned by quartile over all active days,
-/// so the color scale adapts to the user's own activity instead of fixed thresholds.
-private struct HeatmapData {
-    /// startOfDay → total layer changes that day (only days with score > 0 are present).
-    let scores: [Date: Int]
-    /// Quartile cut points over all nonzero daily scores (25th / 50th / 75th percentile).
-    let q1: Int
-    let q2: Int
-    let q3: Int
-
-    /// 0 = no activity (gray); 1…4 = increasing green tiers.
-    func level(forDay day: Date, calendar: Calendar) -> Int {
-        let s = scores[calendar.startOfDay(for: day)] ?? 0
-        guard s > 0 else { return 0 }
-        if s <= q1 { return 1 }
-        if s <= q2 { return 2 }
-        if s <= q3 { return 3 }
-        return 4
-    }
-}
-
 struct HeatmapSection: View {
     @EnvironmentObject var versionStore: VersionStore
 
@@ -983,36 +958,7 @@ struct HeatmapSection: View {
     // MARK: - Data
 
     private func buildHeatmapData() -> HeatmapData {
-        var scores: [Date: Int] = [:]
-        for commits in versionStore.commitCache.values {
-            for commit in commits {
-                let amount = changeAmount(commit)
-                guard amount > 0 else { continue }
-                let day = calendar.startOfDay(for: commit.timestamp)
-                scores[day, default: 0] += amount
-            }
-        }
-        let sorted = scores.values.sorted()
-        return HeatmapData(scores: scores,
-                           q1: percentile(sorted, 0.25),
-                           q2: percentile(sorted, 0.50),
-                           q3: percentile(sorted, 0.75))
-    }
-
-    /// Layer changes a commit represents. The oldest commit of a project has no previous
-    /// snapshot to diff against (layerDiff == nil), so we count its whole tree as additions
-    /// — file creation is real work.
-    private func changeAmount(_ commit: Commit) -> Int {
-        if let diff = commit.layerDiff {
-            return diff.added.count + diff.removed.count
-        }
-        return commit.layerCount
-    }
-
-    private func percentile(_ sorted: [Int], _ p: Double) -> Int {
-        guard !sorted.isEmpty else { return 0 }
-        let idx = Int((Double(sorted.count - 1) * p).rounded())
-        return sorted[idx]
+        HeatmapData.build(from: Array(versionStore.commitCache.values), calendar: calendar)
     }
 }
 
@@ -1245,73 +1191,6 @@ struct DirectoryGroupSection: View {
             geo.size.width
         } action: { contentWidth = $0 }
     }
-}
-
-private nonisolated let previewableExtensions: Set<String> = [
-    "png","jpg","jpeg","gif","webp","tiff","tif","bmp","heic","psd","ai","pdf"
-]
-
-/// A directory entry whose `isDirectory` / `isPreviewable` flags are resolved
-/// once at load time, so the render path never touches the filesystem.
-struct DirectoryItem: Identifiable, Hashable {
-    let url: URL
-    let isDirectory: Bool
-    let isPreviewable: Bool
-
-    nonisolated var id: String { url.path }
-    nonisolated var path: String { url.path }
-    nonisolated var name: String { url.lastPathComponent }
-}
-
-/// Reads, filters and sorts a directory's contents. Pure & `nonisolated` so it
-/// can run off the main thread; resolves `.isDirectoryKey` exactly once per item.
-private nonisolated func loadDirectoryItems(at url: URL) -> [DirectoryItem] {
-    guard let contents = try? FileManager.default.contentsOfDirectory(
-        at: url,
-        includingPropertiesForKeys: [.isDirectoryKey],
-        options: [.skipsHiddenFiles]
-    ) else { return [] }
-
-    let items = contents.compactMap { child -> DirectoryItem? in
-        let isDir = (try? child.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
-        if isDir {
-            // Hide directories that contain no previewable content anywhere.
-            guard directoryHasVisibleContent(child) else { return nil }
-            return DirectoryItem(url: child, isDirectory: true, isPreviewable: false)
-        }
-        guard previewableExtensions.contains(child.pathExtension.lowercased()) else { return nil }
-        return DirectoryItem(url: child, isDirectory: false, isPreviewable: true)
-    }
-
-    return items.sorted { a, b in
-        if a.isDirectory != b.isDirectory { return a.isDirectory }
-        return a.name.localizedStandardCompare(b.name) == .orderedAscending
-    }
-}
-
-/// Whether a directory (recursively) contains at least one previewable file.
-/// Checks direct files first, then descends; early-exits on the first hit, so for
-/// real design folders it returns almost immediately. `nonisolated` for off-main use.
-private nonisolated func directoryHasVisibleContent(_ url: URL) -> Bool {
-    guard let contents = try? FileManager.default.contentsOfDirectory(
-        at: url,
-        includingPropertiesForKeys: [.isDirectoryKey],
-        options: [.skipsHiddenFiles]
-    ) else { return false }
-
-    var subdirectories: [URL] = []
-    for child in contents {
-        let isDir = (try? child.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
-        if isDir {
-            subdirectories.append(child)
-        } else if previewableExtensions.contains(child.pathExtension.lowercased()) {
-            return true
-        }
-    }
-    for subdirectory in subdirectories where directoryHasVisibleContent(subdirectory) {
-        return true
-    }
-    return false
 }
 
 /// Handles row clicks via AppKit so a single click fires *immediately* instead of
