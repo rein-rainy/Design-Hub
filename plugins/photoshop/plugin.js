@@ -124,6 +124,11 @@ function sendSnapshot(eventType) {
   const doc = app.activeDocument;
   if (!doc) return;
 
+  // doc.path may be a File entry object in some UXP versions — coerce to string.
+  const rawPath = doc.path;
+  const filePath = typeof rawPath === 'string' ? rawPath
+    : rawPath?.nativePath ?? rawPath?.fsPath ?? rawPath?.url ?? '';
+
   const tree = buildLayerTree(doc.layers);
   const message = {
     version: 1,
@@ -131,8 +136,8 @@ function sendSnapshot(eventType) {
     app: 'photoshop',
     timestamp: new Date().toISOString(),
     payload: {
-      path: doc.path || '',
-      name: doc.title,
+      path: filePath,
+      name: doc.title || doc.name || 'Untitled.psd',
       layerCount: countLayers(doc.layers),
       topLevelLayerCount: doc.layers.length,
       layerTree: tree,
@@ -167,7 +172,7 @@ async function setup() {
       type: 'document_closed',
       app: 'photoshop',
       timestamp: new Date().toISOString(),
-      payload: { path: doc.path || '', name: doc.title, layerCount: 0, topLevelLayerCount: 0, layerTree: [] },
+      payload: { path: typeof doc.path === 'string' ? doc.path : (doc.path?.nativePath ?? ''), name: doc.title || doc.name || '', layerCount: 0, topLevelLayerCount: 0, layerTree: [] },
     });
   });
 }

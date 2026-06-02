@@ -6,23 +6,33 @@ struct DesignHubApp: App {
     @StateObject private var versionStore: VersionStore = {
         (try? VersionStore.makeDefault()) ?? VersionStore(db: try! Database(path: ":memory:"))
     }()
+    @StateObject private var directoryGroupStore = DirectoryGroupStore()
+    @State private var coordinator = AppCoordinator()
 
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .environmentObject(pluginBridge)
                 .environmentObject(versionStore)
+                .environmentObject(directoryGroupStore)
                 .task {
                     pluginBridge.start()
                     versionStore.subscribe(to: pluginBridge)
+                    versionStore.subscribeToDebugSimulation()
+                    coordinator.bind(to: versionStore)
                 }
         }
         .commands {
             CommandMenu("Debug") {
-                Button("Show Commit Panel") {
-                    CommitPanelController.shared.show(rootView: CommitPanelPlaceholder())
+                Button("Simulate File Save") {
+                    NotificationCenter.default.post(name: .simulateFileSave, object: nil)
                 }
                 .keyboardShortcut("k", modifiers: [.command, .shift])
+
+                Button("Simulate Auto-save Now") {
+                    NotificationCenter.default.post(name: .simulateAutoSaveNow, object: nil)
+                }
+                .keyboardShortcut("j", modifiers: [.command, .shift])
             }
         }
     }

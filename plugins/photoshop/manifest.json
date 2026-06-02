@@ -8,6 +8,12 @@
     "app": "PS",
     "minVersion": "22.0"
   },
+  "requiredPermissions": {
+    "network": {
+      "domains": ["ws://localhost:49152"],
+      "localFileSystem": "none"
+    }
+  },
   "entrypoints": [
     {
       "type": "panel",

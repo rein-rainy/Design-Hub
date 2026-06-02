@@ -21,7 +21,14 @@ final class CommitPanelController {
         hosting.layer?.backgroundColor = .clear
         panel.contentView = hosting
 
-        panel.center()
+        let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) })
+            ?? NSScreen.main ?? NSScreen.screens[0]
+        let sf = screen.frame
+        let pf = panel.frame
+        panel.setFrameOrigin(NSPoint(
+            x: sf.midX - pf.width / 2,
+            y: sf.midY - pf.height / 2
+        ))
 
         panel.alphaValue = 0
         panel.orderFront(nil)

@@ -1,12 +1,29 @@
 import Foundation
 import Combine
 
+extension NSNotification.Name {
+    static let simulateFileSave    = NSNotification.Name("DesignHub.simulateFileSave")
+    static let simulateAutoSaveNow = NSNotification.Name("DesignHub.simulateAutoSaveNow")
+}
+
 @MainActor
 final class VersionStore: ObservableObject {
 
     @Published private(set) var projects: [Project] = []
     /// Reactive commit cache — updated after every save and after thumbnail generation.
     @Published private(set) var commitCache: [String: [Commit]] = [:]
+    /// Pending save waiting for user confirmation via the commit panel.
+    /// Uses didSet (not @Published) so the callback fires after the value is set,
+    /// avoiding @Published's willSet timing issue with Swift Concurrency tasks.
+    private(set) var pendingMessage: PluginMessage? = nil {
+        didSet { onPendingMessageChanged?(pendingMessage) }
+    }
+    var onPendingMessageChanged: ((PluginMessage?) -> Void)?
+
+    // MARK: - Auto-save
+    @Published var autoSaveEnabled: Bool = true
+    private weak var bridge: PluginBridgeServer? = nil
+    private var autoSaveTimerTask: Task<Void, Never>? = nil
 
     private let db: Database
     private var cancellables = Set<AnyCancellable>()
@@ -34,14 +51,120 @@ final class VersionStore: ObservableObject {
 
     // MARK: - Bridge subscription
 
+    func subscribeToDebugSimulation() {
+        NotificationCenter.default.addObserver(
+            forName: .simulateFileSave,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.pendingMessage = PluginMessage(
+                    version: 1,
+                    type: .documentSaved,
+                    app: .photoshop,
+                    timestamp: Date(),
+                    payload: DocumentPayload(
+                        path: "",
+                        name: "Untitled.psd",
+                        layerCount: 5,
+                        topLevelLayerCount: 3,
+                        layerTree: [],
+                        artboardCount: nil,
+                        artboardNames: nil
+                    )
+                )
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: .simulateAutoSaveNow,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.simulateAutoSaveNow()
+            }
+        }
+    }
+
+    func simulateAutoSaveNow() {
+        let msg = PluginMessage(
+            version: 1,
+            type: .documentSaved,
+            app: .photoshop,
+            timestamp: Date(),
+            payload: DocumentPayload(
+                path: "",
+                name: "Untitled.psd",
+                layerCount: 5,
+                topLevelLayerCount: 3,
+                layerTree: [],
+                artboardCount: nil,
+                artboardNames: nil
+            )
+        )
+        record(msg, commitMessage: "", isAutosave: true)
+    }
+
     func subscribe(to bridge: PluginBridgeServer) {
+        self.bridge = bridge
         cancellables.removeAll()
+
         bridge.messagePublisher
             .filter { $0.type == .documentSaved }
             .sink { [weak self] message in
-                self?.record(message)
+                self?.pendingMessage = message
             }
             .store(in: &cancellables)
+
+        bridge.messagePublisher
+            .filter { $0.type == .snapshotRequested }
+            .sink { [weak self] message in
+                self?.record(message, commitMessage: "", isAutosave: true)
+            }
+            .store(in: &cancellables)
+
+        startAutoSaveTimer()
+    }
+
+    private func startAutoSaveTimer() {
+        autoSaveTimerTask?.cancel()
+        autoSaveTimerTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(600))
+                guard !Task.isCancelled, let self else { break }
+                guard self.autoSaveEnabled else { continue }
+                self.bridge?.requestSnapshot()
+                print("[VersionStore] Auto-save snapshot requested")
+            }
+        }
+    }
+
+    // MARK: - Pending commit
+
+    func confirmCommit(commitMessage: String) {
+        guard let message = pendingMessage else { return }
+        pendingMessage = nil
+        record(message, commitMessage: commitMessage, isAutosave: false)
+    }
+
+    func cancelPending() {
+        pendingMessage = nil
+    }
+
+    func layerDiffForPending() -> LayerDiff? {
+        guard let message = pendingMessage else { return nil }
+        return layerDiff(for: message)
+    }
+
+    func layerDiff(for message: PluginMessage) -> LayerDiff? {
+        let path = message.payload.path.isEmpty
+            ? "\(message.app.rawValue)://\(message.payload.name)"
+            : message.payload.path
+        guard let project = projects.first(where: { $0.path == path }),
+              let lastCommit = commits(forProjectID: project.id).first
+        else { return nil }
+        return diffLayers(from: lastCommit.layerTree, to: message.payload.layerTree)
     }
 
     // MARK: - Public
@@ -52,17 +175,21 @@ final class VersionStore: ObservableObject {
 
     // MARK: - Private: record
 
-    private func record(_ message: PluginMessage) {
-        let path = message.payload.path.isEmpty
+    private func record(_ message: PluginMessage, commitMessage: String = "", isAutosave: Bool = false) {
+        let rawPath = message.payload.path.isEmpty
             ? "\(message.app.rawValue)://\(message.payload.name)"
             : message.payload.path
+        let path = rawPath.hasPrefix("file://")
+            ? (URL(string: rawPath)?.resolvingSymlinksInPath().path ?? rawPath)
+            : (rawPath.hasPrefix("/") ? URL(fileURLWithPath: rawPath).resolvingSymlinksInPath().path : rawPath)
         let project = findOrCreate(path: path, name: message.payload.name, app: message.app)
         let commitID = UUID().uuidString
         let backupPath = backupFile(sourcePath: message.payload.path,
                                     commitID: commitID,
                                     projectID: project.id)
         insertCommit(from: message, projectID: project.id, commitID: commitID,
-                     backupPath: backupPath, thumbnailPath: nil)
+                     backupPath: backupPath, thumbnailPath: nil, commitMessage: commitMessage,
+                     isAutosave: isAutosave)
         reload()
 
         // Generate thumbnail asynchronously; update DB + UI when done.
@@ -191,7 +318,9 @@ final class VersionStore: ObservableObject {
                                projectID: String,
                                commitID: String,
                                backupPath: String?,
-                               thumbnailPath: String?) {
+                               thumbnailPath: String?,
+                               commitMessage: String = "",
+                               isAutosave: Bool = false) {
         let treeJSON = (try? encoder.encode(message.payload.layerTree))
             .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
 
@@ -200,7 +329,7 @@ final class VersionStore: ObservableObject {
             INSERT INTO commits
               (id, project_id, timestamp, layer_count, top_level_layer_count,
                artboard_count, layer_tree, is_autosave, message, backup_path, thumbnail_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1, '', ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 .text(commitID),
@@ -210,6 +339,8 @@ final class VersionStore: ObservableObject {
                 .integer(Int64(message.payload.topLevelLayerCount)),
                 message.payload.artboardCount.map { .integer(Int64($0)) } ?? .null,
                 .text(treeJSON),
+                .integer(isAutosave ? 1 : 0),
+                .text(commitMessage),
                 backupPath.map { .text($0) } ?? .null,
                 thumbnailPath.map { .text($0) } ?? .null,
             ]
@@ -245,8 +376,13 @@ final class VersionStore: ObservableObject {
     }
 
     private func migrate() {
-        try? db.exec("ALTER TABLE commits ADD COLUMN backup_path TEXT")
-        try? db.exec("ALTER TABLE commits ADD COLUMN thumbnail_path TEXT")
+        let existing = (try? db.query("PRAGMA table_info(commits)"))?.compactMap { $0["name"]?.string } ?? []
+        if !existing.contains("backup_path") {
+            try? db.exec("ALTER TABLE commits ADD COLUMN backup_path TEXT")
+        }
+        if !existing.contains("thumbnail_path") {
+            try? db.exec("ALTER TABLE commits ADD COLUMN thumbnail_path TEXT")
+        }
     }
 
     // MARK: - Private: mapping

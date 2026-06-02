@@ -8,7 +8,6 @@ enum ThumbnailGenerator {
     /// Saves it as a .jpg next to the source file and returns the output URL.
     static func generate(from fileURL: URL,
                          size: CGSize = CGSize(width: 400, height: 400)) async -> URL? {
-        // macOS uses QLThumbnailGenerator.Request (QLThumbnailGenerationRequest)
         let request = QLThumbnailGenerator.Request(
             fileAt: fileURL,
             size: size,
@@ -44,6 +43,28 @@ enum ThumbnailGenerator {
                     print("[Thumbnail] Write failed: \(error.localizedDescription)")
                     continuation.resume(returning: nil)
                 }
+            }
+        }
+    }
+
+    /// Renders a high-resolution NSImage from a QuickLook-compatible file (PSD, AI, PNG, …).
+    /// Does not write to disk — returns the image directly for canvas display.
+    static func renderHiRes(from fileURL: URL, size: CGSize) async -> NSImage? {
+        let request = QLThumbnailGenerator.Request(
+            fileAt: fileURL,
+            size: size,
+            scale: 1.0,
+            representationTypes: .thumbnail
+        )
+
+        return await withCheckedContinuation { continuation in
+            QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { rep, error in
+                guard let rep, error == nil else {
+                    print("[Thumbnail] HiRes failed for \(fileURL.lastPathComponent): \(error?.localizedDescription ?? "unknown")")
+                    continuation.resume(returning: nil)
+                    return
+                }
+                continuation.resume(returning: rep.nsImage)
             }
         }
     }

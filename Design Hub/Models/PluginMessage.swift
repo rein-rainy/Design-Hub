@@ -2,7 +2,7 @@ import Foundation
 
 // Matches the JSON protocol sent by the Photoshop and Illustrator UXP plugins.
 
-struct PluginMessage: Codable {
+struct PluginMessage: Codable, Equatable {
     let version: Int
     let type: EventType
     let app: AppSource
@@ -22,7 +22,7 @@ struct PluginMessage: Codable {
     }
 }
 
-struct DocumentPayload: Codable {
+struct DocumentPayload: Codable, Equatable {
     let path: String
     let name: String
     let layerCount: Int
