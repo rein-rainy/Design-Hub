@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Combine
 
@@ -20,12 +21,42 @@ final class LiveDocumentStore: ObservableObject {
     @Published private(set) var documents: [LiveDocument] = []
 
     private var cancellables = Set<AnyCancellable>()
+    // Kept separate from `cancellables` so re-subscribing to a bridge doesn't tear
+    // down the OS-level termination watcher.
+    private var terminationObserver: AnyCancellable?
+
+    init() {
+        // A plugin can't always send `document_closed` for every open document when
+        // its host app quits or crashes (or the bridge connection just drops). Watch
+        // the OS for Photoshop/Illustrator terminating and clear that app's documents
+        // so "Now Editing" can never show entries for an app that's no longer running.
+        terminationObserver = NSWorkspace.shared.notificationCenter
+            .publisher(for: NSWorkspace.didTerminateApplicationNotification)
+            .compactMap { $0.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication }
+            .compactMap { Self.appSource(for: $0) }
+            .sink { [weak self] app in
+                self?.documents.removeAll { $0.app == app }
+            }
+    }
 
     func subscribe(to bridge: PluginBridgeServer) {
         cancellables.removeAll()
         bridge.messagePublisher
             .sink { [weak self] message in self?.handle(message) }
             .store(in: &cancellables)
+    }
+
+    /// Maps a terminated running application to the design app it represents,
+    /// matching on the bundle identifier so version suffixes don't matter.
+    /// Adobe spawns helper processes whose bundle IDs also contain the app name,
+    /// so we only treat the main GUI app (a `.regular` app) as the host quitting —
+    /// otherwise a helper dying would wipe a still-open document from "Now Editing".
+    private static func appSource(for app: NSRunningApplication) -> PluginMessage.AppSource? {
+        guard app.activationPolicy == .regular,
+              let bundleID = app.bundleIdentifier?.lowercased() else { return nil }
+        if bundleID.contains("photoshop") { return .photoshop }
+        if bundleID.contains("illustrator") { return .illustrator }
+        return nil
     }
 
     private func handle(_ message: PluginMessage) {
