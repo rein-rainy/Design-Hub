@@ -24,6 +24,9 @@ final class VersionStore: ObservableObject {
     @Published var autoSaveEnabled: Bool = true
     private weak var bridge: PluginBridgeServer? = nil
     private var autoSaveTimerTask: Task<Void, Never>? = nil
+    /// Fired just before an auto-save snapshot request. DocumentSaveWatcher uses
+    /// this to ignore the file write our own request is about to cause.
+    var onAutoSaveRequested: (() -> Void)?
 
     private let repository: CommitRepository
     private var cancellables = Set<AnyCancellable>()
@@ -40,8 +43,28 @@ final class VersionStore: ObservableObject {
 
     // MARK: - Init
 
+    /// Auto-saves are transient history — keep only the last two weeks of them.
+    private static let autoSaveRetention: TimeInterval = 14 * 24 * 60 * 60
+
     init(db: Database) {
         self.repository = CommitRepository(db: db)
+        purgeExpiredAutosaves()
+        reload()
+    }
+
+    /// Removes auto-save commits older than the retention window, along with their
+    /// on-disk backup and thumbnail files. Manual commits are kept indefinitely.
+    private func purgeExpiredAutosaves() {
+        let cutoff = Date().addingTimeInterval(-Self.autoSaveRetention)
+        let expired = repository.deleteExpiredAutosaves(olderThan: cutoff)
+        guard !expired.isEmpty else { return }
+
+        let fm = FileManager.default
+        for commit in expired {
+            if let path = commit.backupPath { try? fm.removeItem(atPath: path) }
+            if let path = commit.thumbnailPath { try? fm.removeItem(atPath: path) }
+        }
+        print("[VersionStore] Purged \(expired.count) expired auto-save(s)")
         reload()
     }
 
@@ -109,7 +132,9 @@ final class VersionStore: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(600))
                 guard !Task.isCancelled, let self else { break }
+                self.purgeExpiredAutosaves()
                 guard self.autoSaveEnabled else { continue }
+                self.onAutoSaveRequested?()
                 self.bridge?.requestSnapshot()
                 print("[VersionStore] Auto-save snapshot requested")
             }
@@ -121,8 +146,18 @@ final class VersionStore: ObservableObject {
     func confirmCommit(commitMessage: String) {
         guard let message = pendingMessage else { return }
         pendingMessage = nil
-        record(message, commitMessage: commitMessage, isAutosave: false)
+        // Fall back to a timestamped title ("Commit {date}") when the user commits
+        // without typing a message, instead of leaving it blank.
+        let trimmed = commitMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolved = trimmed.isEmpty ? "Commit \(Self.defaultMessageDateFormatter.string(from: Date()))" : trimmed
+        record(message, commitMessage: resolved, isAutosave: false)
     }
+
+    private static let defaultMessageDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f
+    }()
 
     func cancelPending() {
         pendingMessage = nil
@@ -162,12 +197,28 @@ final class VersionStore: ObservableObject {
                                                       andPath: backupPath)
         }
 
-        // Fallback (unsaved/simulated docs): compare layer structure + counts.
+        // Fallback (unsaved/simulated docs): compare shape count + layer structure.
         let diff = LayerDiffer.diff(from: lastCommit.layerTree, to: message.payload.layerTree)
         return !diff.isEmpty
+            || lastCommit.shapeCount != message.payload.shapeCount
             || lastCommit.layerCount != message.payload.layerCount
             || lastCommit.topLevelLayerCount != message.payload.topLevelLayerCount
             || lastCommit.artboardCount != message.payload.artboardCount
+    }
+
+    /// Shapes added/removed between the incoming snapshot and the latest commit
+    /// (Illustrator only). Drives the pending commit panel's +N/-N badge.
+    func shapeChangeForPending() -> ShapeChange? {
+        guard let message = pendingMessage else { return nil }
+        return shapeChange(for: message)
+    }
+
+    func shapeChange(for message: PluginMessage) -> ShapeChange? {
+        guard let project = projects.first(where: { $0.path == canonicalPath(for: message) }),
+              let lastCommit = commits(forProjectID: project.id).first
+        else { return nil }
+        return ShapeChange.between(oldIds: lastCommit.shapeIds, oldCount: lastCommit.shapeCount,
+                                   newIds: message.payload.shapeIds, newCount: message.payload.shapeCount)
     }
 
     func layerDiff(for message: PluginMessage) -> LayerDiff? {
@@ -181,6 +232,25 @@ final class VersionStore: ObservableObject {
 
     func commits(forProjectID id: String) -> [Commit] {
         commitCache[id] ?? []
+    }
+
+    // MARK: - Edit / delete
+
+    /// Renames a commit's message. An empty/whitespace-only string clears it back
+    /// to the "No message" placeholder behaviour.
+    func rename(commit: Commit, to newMessage: String) {
+        let trimmed = newMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        repository.updateMessage(commitID: commit.id, message: trimmed)
+        reload()
+    }
+
+    /// Permanently deletes a commit and its on-disk backup + thumbnail files.
+    func delete(commit: Commit) {
+        repository.deleteCommit(commitID: commit.id)
+        let fm = FileManager.default
+        if let path = commit.backupPath { try? fm.removeItem(atPath: path) }
+        if let path = commit.thumbnailPath { try? fm.removeItem(atPath: path) }
+        reload()
     }
 
     // MARK: - Restore
@@ -271,6 +341,9 @@ final class VersionStore: ObservableObject {
                 if i + 1 < commits.count {
                     commits[i].layerDiff = LayerDiffer.diff(from: commits[i + 1].layerTree,
                                                             to: commits[i].layerTree)
+                    commits[i].shapeChange = ShapeChange.between(
+                        oldIds: commits[i + 1].shapeIds, oldCount: commits[i + 1].shapeCount,
+                        newIds: commits[i].shapeIds, newCount: commits[i].shapeCount)
                 }
             }
             cache[project.id] = commits
@@ -315,6 +388,8 @@ final class VersionStore: ObservableObject {
                 layerCount: 5,
                 topLevelLayerCount: 3,
                 layerTree: [],
+                shapeCount: nil,
+                shapeIds: nil,
                 artboardCount: nil,
                 artboardNames: nil
             )

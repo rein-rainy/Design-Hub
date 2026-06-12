@@ -9,64 +9,124 @@ enum ViewMode: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-struct ContentView: View {
-    @EnvironmentObject var directoryStore: DirectoryGroupStore
-    @EnvironmentObject var versionStore: VersionStore
-    @State private var isInspectorPresented: Bool = true
-    @State private var selectedMode: ViewMode = .single
-    @State private var canvasScale: CGFloat = 1.0
-    @State private var selectedCommit: Commit? = nil
-    @State private var restoredFileURL: URL? = nil
-    @State private var showRestoreError: Bool = false
+/// Top-level workspace mode. `versions` is the existing commit/preview workspace;
+/// `moodboard` is the upcoming PureRef-style per-project reference board.
+enum AppMode: String, CaseIterable, Identifiable {
+    case versions = "Versions"
+    case moodboard = "Moodboard"
 
+    var id: String { rawValue }
+
+    var symbol: String {
+        switch self {
+        case .versions: return "clock.arrow.circlepath"
+        case .moodboard: return "square.grid.2x2"
+        }
+    }
+}
+
+/// Top-level shell: just the split view. It holds no volatile per-view state, so
+/// switching modes or zooming the canvas never re-evaluates this body — and the
+/// left sidebar is left untouched. Detail-side state lives in `DetailView`.
+struct ContentView: View {
     var body: some View {
         NavigationSplitView {
             LeftSidebar()
                 .navigationSplitViewColumnWidth(min: 210, ideal: 220, max: 230)
         } detail: {
-            CanvasView(scale: $canvasScale, selectedMode: selectedMode, selectedCommit: selectedCommit)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .overlay(alignment: .bottomLeading) {
-                    ViewModeSwitcher(selectedMode: $selectedMode)
-                        .padding(20)
-                }
-                .overlay(alignment: .bottomTrailing) {
-                    ZoomIndicator(scale: canvasScale) { newScale in
-                        withAnimation(.spring(duration: 0.35)) {
-                            canvasScale = newScale
-                        }
-                    }
-                    .padding(20)
-                }
-                .inspector(isPresented: $isInspectorPresented) {
-                    RightSidebar(selectedCommit: $selectedCommit)
-                        .inspectorColumnWidth(min: 240, ideal: 300, max: 400)
-                }
-                .toolbar {
-                    if let commit = selectedCommit {
-                        ToolbarItem(placement: .primaryAction) {
-                            Button {
-                                restore(commit)
-                            } label: {
-                                Label("Restore", systemImage: "arrow.uturn.backward")
-                            }
-                            .help("Restore this version as a new file next to the original")
-                        }
-                    }
-                    ToolbarItem(placement: .primaryAction) {
-                        Button {
-                            isInspectorPresented.toggle()
-                        } label: {
-                            Image(systemName: "sidebar.right")
-                        }
-                        .help(isInspectorPresented ? "Hide Inspector" : "Show Inspector")
+            DetailView()
+        }
+        .frame(minWidth: 640, minHeight: 400)
+    }
+}
+
+/// The detail column: owns the app mode, the inspector, and the
+/// sidebar-selected commit (shared between the canvas and the inspector).
+/// Canvas-only state (zoom / view mode) is isolated further down in
+/// `VersionsCanvas`, so zooming never re-evaluates this body — keeping the
+/// right-hand inspector from re-rendering.
+struct DetailView: View {
+    @EnvironmentObject var directoryStore: DirectoryGroupStore
+    @EnvironmentObject var versionStore: VersionStore
+    @State private var appMode: AppMode = .versions
+    @State private var isInspectorPresented: Bool = true
+    @State private var selectedCommit: Commit? = nil
+    @State private var showRestoreError: Bool = false
+    /// Last user-set inspector width, fed back as the column's `ideal`. With a
+    /// constant ideal, hiding the inspector first snapped a user-widened column
+    /// back to the ideal width before the close animation — a visible jolt.
+    @State private var inspectorWidth: CGFloat = 300
+
+    /// Selected file name, shown as the plain window title.
+    private var fileTitle: String {
+        directoryStore.selectedFile?.lastPathComponent ?? ""
+    }
+
+    var body: some View {
+        Group {
+            switch appMode {
+            case .versions:
+                VersionsCanvas(selectedCommit: $selectedCommit)
+            case .moodboard:
+                MoodboardCanvas()
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // The inspector belongs to the Versions workspace only — hide it entirely
+        // in Moodboard mode while preserving the user's show/hide preference.
+        .inspector(isPresented: Binding(
+            get: { appMode == .versions && isInspectorPresented },
+            // Only record the user's preference while in Versions. In Moodboard the
+            // inspector is force-hidden, and the framework's write-back of `false`
+            // must not clobber the remembered show/hide state.
+            set: { newValue in
+                if appMode == .versions { isInspectorPresented = newValue }
+            }
+        )) {
+            RightSidebar(selectedCommit: $selectedCommit)
+                .inspectorColumnWidth(min: 240, ideal: inspectorWidth, max: 400)
+                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width in
+                    // Record only while fully shown — the collapse animation also
+                    // streams shrinking widths, which must not become the ideal.
+                    if appMode == .versions && isInspectorPresented && width >= 240 {
+                        inspectorWidth = width
                     }
                 }
         }
-        .frame(minWidth: 640, minHeight: 400)
+        // Show the selected file name as the plain window title (leading). Using
+        // the title rather than a toolbar item keeps it as plain text instead of
+        // getting macOS 26's automatic glass-capsule treatment.
+        .navigationTitle(fileTitle)
+        .toolbar {
+            // Center: Versions / Moodboard switcher (system segmented picker).
+            ToolbarItem(placement: .principal) {
+                AppModeSwitcher(appMode: $appMode)
+            }
+            // Right side: revert (when a version is selected) then inspector toggle.
+            if appMode == .versions, let commit = selectedCommit {
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        restore(commit)
+                    } label: {
+                        Image(systemName: "arrow.uturn.backward")
+                    }
+                    .help("Restore this version as a new file next to the original")
+                }
+            }
+            // Always present (just disabled in Moodboard): removing the item
+            // entirely re-laid-out the toolbar and made the mode switch jitter.
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    isInspectorPresented.toggle()
+                } label: {
+                    Image(systemName: "sidebar.right")
+                }
+                .disabled(appMode != .versions)
+                .help(isInspectorPresented ? "Hide Inspector" : "Show Inspector")
+            }
+        }
         .onChange(of: directoryStore.selectedFile) { _ in
             selectedCommit = nil
-            selectedMode = .single
         }
         .alert("Restore Failed", isPresented: $showRestoreError) {
             Button("OK", role: .cancel) {}
@@ -77,12 +137,40 @@ struct ContentView: View {
 
     private func restore(_ commit: Commit) {
         if let url = versionStore.restore(commit: commit) {
-            restoredFileURL = url
             // Reveal the freshly restored file in Finder so it's easy to find.
             NSWorkspace.shared.activateFileViewerSelecting([url])
         } else {
             showRestoreError = true
         }
+    }
+}
+
+/// The Versions workspace canvas plus its floating mode switcher and zoom
+/// indicator. Zoom (`canvasScale`) and `selectedMode` live here so changing them
+/// only re-evaluates this view — not the inspector or the sidebars.
+struct VersionsCanvas: View {
+    @EnvironmentObject var directoryStore: DirectoryGroupStore
+    @Binding var selectedCommit: Commit?
+    @State private var selectedMode: ViewMode = .single
+    @State private var canvasScale: CGFloat = 1.0
+
+    var body: some View {
+        CanvasView(scale: $canvasScale, selectedMode: selectedMode, selectedCommit: selectedCommit)
+            .overlay(alignment: .bottomLeading) {
+                ViewModeSwitcher(selectedMode: $selectedMode)
+                    .padding(20)
+            }
+            .overlay(alignment: .bottomTrailing) {
+                ZoomIndicator(scale: canvasScale) { newScale in
+                    withAnimation(.spring(duration: 0.35)) {
+                        canvasScale = newScale
+                    }
+                }
+                .padding(20)
+            }
+            .onChange(of: directoryStore.selectedFile) { _ in
+                selectedMode = .single
+            }
     }
 }
 
@@ -424,6 +512,27 @@ private final class ScrollWheelNSView: NSView {
     }
 }
 
+/// Versions / Moodboard switcher — the system segmented picker (text only),
+/// centered in the header.
+struct AppModeSwitcher: View {
+    @Binding var appMode: AppMode
+
+    var body: some View {
+        Picker("Mode", selection: $appMode) {
+            ForEach(AppMode.allCases) { mode in
+                // Pad "Moodboard" with two spaces each side so its segment isn't
+                // visually cramped next to "Versions".
+                Text(mode == .moodboard ? "  \(mode.rawValue)  " : mode.rawValue)
+                    .tag(mode)
+            }
+        }
+        .pickerStyle(.segmented)
+        .fixedSize()
+    }
+}
+
+/// Floating Single / Compare / Slider switcher, in a liquid-glass capsule. Pinned
+/// at the bottom-left of the canvas.
 struct ViewModeSwitcher: View {
     @Binding var selectedMode: ViewMode
 
@@ -690,8 +799,8 @@ struct CommitDaySection: View {
                         case .single(let commit):
                             CommitItemView(
                                 commit: commit,
-                                isSelected: selectedCommit?.id == commit.id
-                            ) { selectedCommit = commit }
+                                selectedCommit: $selectedCommit
+                            )
                         case .autosaveGroup(let gid, let commits):
                             AutosaveGroupRow(
                                 commits: commits,
@@ -745,9 +854,9 @@ struct AutosaveGroupRow: View {
                         ForEach(commits) { commit in
                             CommitItemView(
                                 commit: commit,
-                                isSelected: selectedCommit?.id == commit.id,
+                                selectedCommit: $selectedCommit,
                                 autoSaveIndex: autoSaveNumbers[commit.id]
-                            ) { selectedCommit = commit }
+                            )
                         }
                     }
                 }
@@ -758,11 +867,26 @@ struct AutosaveGroupRow: View {
 }
 
 struct CommitItemView: View {
+    @EnvironmentObject var versionStore: VersionStore
     let commit: Commit
-    let isSelected: Bool
+    @Binding var selectedCommit: Commit?
     var autoSaveIndex: Int? = nil
-    let onSelect: () -> Void
     @State private var thumbnail: NSImage? = nil
+    @State private var showRename = false
+    @State private var draftMessage = ""
+    @State private var showDeleteConfirm = false
+    @State private var showRestoreError = false
+
+    private var isSelected: Bool { selectedCommit?.id == commit.id }
+
+    private func restore() {
+        if let url = versionStore.restore(commit: commit) {
+            // Reveal the freshly restored file in Finder so it's easy to find.
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } else {
+            showRestoreError = true
+        }
+    }
 
     private var timeLabel: String {
         relativeFormatter.localizedString(for: commit.timestamp, relativeTo: Date())
@@ -775,14 +899,15 @@ struct CommitItemView: View {
                     Text(timeLabel)
                         .font(.callout)
                         .foregroundColor(Color(NSColor.secondaryLabelColor))
-                    if let diff = commit.layerDiff, !diff.isEmpty {
+                    let badge = ChangeBadge.counts(shapeChange: commit.shapeChange, layerDiff: commit.layerDiff)
+                    if badge.added > 0 || badge.removed > 0 {
                         HStack(spacing: 6) {
-                            if diff.added.count > 0 {
-                                Text("+\(diff.added.count)")
+                            if badge.added > 0 {
+                                Text("+\(badge.added)")
                                     .foregroundColor(Color(NSColor.systemGreen))
                             }
-                            if diff.removed.count > 0 {
-                                Text("-\(diff.removed.count)")
+                            if badge.removed > 0 {
+                                Text("-\(badge.removed)")
                                     .foregroundColor(Color(NSColor.systemRed))
                             }
                         }
@@ -828,10 +953,100 @@ struct CommitItemView: View {
                 )
         )
         .contentShape(RoundedRectangle(cornerRadius: 10))
-        .onTapGesture { onSelect() }
+        .overlay(RightClickCatcher { selectedCommit = commit })
+        .onTapGesture { selectedCommit = commit }
+        .contextMenu {
+            if commit.hasBackup {
+                Button {
+                    restore()
+                } label: {
+                    Label("Restore", systemImage: "arrow.uturn.backward")
+                }
+            }
+            Button {
+                draftMessage = commit.message
+                showRename = true
+            } label: {
+                Label("Rename", systemImage: "pencil")
+            }
+            Divider()
+            Button(role: .destructive) {
+                showDeleteConfirm = true
+            } label: {
+                Label("Delete", systemImage: "trash")
+            }
+        }
+        .alert("Restore Failed", isPresented: $showRestoreError) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("This version could not be restored. The backup or original file may be missing, or the file was never saved to disk.")
+        }
+        .alert("Rename Commit", isPresented: $showRename) {
+            TextField("Commit message", text: $draftMessage)
+            Button("Cancel", role: .cancel) {}
+            Button("Save") {
+                versionStore.rename(commit: commit, to: draftMessage)
+                // Keep the open detail panel in sync if this commit is selected.
+                if selectedCommit?.id == commit.id {
+                    var updated = commit
+                    updated.message = draftMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+                    selectedCommit = updated
+                }
+            }
+        }
+        .confirmationDialog("Delete this commit?", isPresented: $showDeleteConfirm, titleVisibility: .visible) {
+            Button("Delete", role: .destructive) {
+                if selectedCommit?.id == commit.id { selectedCommit = nil }
+                versionStore.delete(commit: commit)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Its backup is removed too. This can't be undone.")
+        }
         .task(id: commit.thumbnailPath) {
             guard let path = commit.thumbnailPath else { return }
             thumbnail = NSImage(contentsOfFile: path)
+        }
+    }
+}
+
+/// Transparent overlay that fires `onRightClick` on a right mouse press while
+/// letting left clicks (and SwiftUI's own `.contextMenu`) pass through. Used so
+/// right-clicking a commit row selects it — switching the canvas — before the
+/// context menu's action is even chosen.
+struct RightClickCatcher: NSViewRepresentable {
+    let onRightClick: () -> Void
+
+    func makeNSView(context: Context) -> NSView { CatcherView(onRightClick) }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        (nsView as? CatcherView)?.onRightClick = onRightClick
+    }
+
+    final class CatcherView: NSView {
+        var onRightClick: () -> Void
+
+        init(_ onRightClick: @escaping () -> Void) {
+            self.onRightClick = onRightClick
+            super.init(frame: .zero)
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+        // Only claim right-click events; return nil for everything else so left
+        // clicks reach SwiftUI's tap gesture underneath.
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            switch NSApp.currentEvent?.type {
+            case .rightMouseDown, .rightMouseUp: return self
+            default: return nil
+            }
+        }
+
+        override func rightMouseDown(with event: NSEvent) {
+            onRightClick()
+            // Bubble up so SwiftUI's .contextMenu still pops up.
+            super.rightMouseDown(with: event)
         }
     }
 }
@@ -841,6 +1056,9 @@ struct HeatmapSection: View {
 
     /// Anchor inside the currently displayed month. Defaults to today's month.
     @State private var monthAnchor: Date = Date()
+
+    /// Day whose activity popover is currently shown (set on hover).
+    @State private var hoveredDay: Date?
 
     private let calendar = Calendar.current
 
@@ -905,9 +1123,92 @@ struct HeatmapSection: View {
         let level = Self.debugRandomColors
             ? debugLevel(for: day)
             : data.level(forDay: day, calendar: calendar)
+        let deltas = data.deltas(forDay: day, calendar: calendar)
         return RoundedRectangle(cornerRadius: 4)
             .fill(color(forLevel: level))
             .aspectRatio(1, contentMode: .fit)
+            .onHover { inside in
+                guard deltas != nil else { return }
+                hoveredDay = inside ? calendar.startOfDay(for: day) : nil
+            }
+            .popover(isPresented: Binding(
+                get: { hoveredDay == calendar.startOfDay(for: day) && deltas != nil },
+                set: { if !$0 { hoveredDay = nil } }
+            ), arrowEdge: .top) {
+                if let deltas {
+                    deltaPopover(deltas)
+                }
+            }
+    }
+
+    /// Per-app "icon  +N  -N" layer-change summary shown when hovering a day with
+    /// activity. Each editing app (Ps / Ai) gets its own row.
+    private func deltaPopover(_ deltas: [HeatmapData.AppDelta]) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(deltas, id: \.app) { delta in
+                HStack(spacing: 6) {
+                    appIconView(for: delta.app)
+                        .frame(width: 14, height: 14)
+                    if delta.added > 0 {
+                        Text("+\(delta.added)")
+                            .foregroundColor(Color(NSColor.systemGreen))
+                    }
+                    if delta.removed > 0 {
+                        Text("-\(delta.removed)")
+                            .foregroundColor(Color(NSColor.systemRed))
+                    }
+                }
+            }
+        }
+        .font(.system(size: 12, weight: .semibold))
+        .monospacedDigit()
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    /// The editing app's real macOS application icon, falling back to the bundled
+    /// brand glyph when the app isn't installed.
+    @ViewBuilder
+    private func appIconView(for app: PluginMessage.AppSource) -> some View {
+        if let icon = Self.appIcon(for: app) {
+            Image(nsImage: icon)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+        } else {
+            Image(fallbackIconName(for: app))
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+        }
+    }
+
+    /// Asset-catalog name of the bundled brand glyph for an editing app.
+    private func fallbackIconName(for app: PluginMessage.AppSource) -> String {
+        switch app {
+        case .photoshop: return "Ps"
+        case .illustrator: return "Ai"
+        }
+    }
+
+    private static let appIconCache = NSCache<NSString, NSImage>()
+
+    /// Looks up the installed app's icon by bundle identifier (cached).
+    private static func appIcon(for app: PluginMessage.AppSource) -> NSImage? {
+        let bundleID: String
+        switch app {
+        case .photoshop: bundleID = "com.adobe.Photoshop"
+        case .illustrator: bundleID = "com.adobe.illustrator"
+        }
+        if let cached = appIconCache.object(forKey: bundleID as NSString) { return cached }
+        // Beta and release builds share a bundle ID (e.g. com.adobe.Photoshop), so
+        // prefer a non-"Beta" install; fall back to whatever LaunchServices returns.
+        let candidates = NSWorkspace.shared.urlsForApplications(withBundleIdentifier: bundleID)
+        guard let url = candidates.first(where: { !$0.path.localizedCaseInsensitiveContains("beta") })
+            ?? candidates.first
+            ?? NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
+        else { return nil }
+        let icon = NSWorkspace.shared.icon(forFile: url.path)
+        appIconCache.setObject(icon, forKey: bundleID as NSString)
+        return icon
     }
 
     /// Deterministic 0…4 level seeded by the day, so colors stay stable across redraws.
@@ -940,15 +1241,22 @@ struct HeatmapSection: View {
         }
     }
 
-    /// Fixed 5×7 grid for the displayed month: 35 consecutive days starting from the 1st.
-    /// Not a calendar-accurate month layout (no weekday alignment / blank slots) — the
-    /// shape is always 5 rows of 7 so the sidebar block never changes size.
+    /// Weekday-aligned month grid like a real calendar: rows start on Sunday
+    /// (matching the S M T W T F S header), leading cells before the 1st show the
+    /// previous month's trailing days, and trailing cells after the last day show
+    /// the next month's leading days. Always 5 rows of 7 so the sidebar block never
+    /// changes size — months spanning 6 weeks get their last day(s) clipped.
     private func monthWeeks() -> [[Date]] {
         guard let firstOfMonth = calendar.date(from: calendar.dateComponents([.year, .month], from: monthAnchor))
         else { return [] }
 
+        // .weekday is 1 (Sunday) … 7 (Saturday); back up to the Sunday on/before the 1st.
+        let leading = calendar.component(.weekday, from: firstOfMonth) - 1
+        guard let gridStart = calendar.date(byAdding: .day, value: -leading, to: firstOfMonth)
+        else { return [] }
+
         let days: [Date] = (0..<35).compactMap {
-            calendar.date(byAdding: .day, value: $0, to: firstOfMonth)
+            calendar.date(byAdding: .day, value: $0, to: gridStart)
         }
         return stride(from: 0, to: days.count, by: 7).map {
             Array(days[$0..<min($0 + 7, days.count)])
@@ -1009,13 +1317,13 @@ struct LiveGroupSection: View {
     }
 }
 
-/// Small green "live" indicator with a gentle pulse.
+/// Small gray "live" indicator with a gentle pulse.
 struct LivePulseDot: View {
     @State private var pulsing = false
 
     var body: some View {
         Circle()
-            .fill(Color(NSColor.systemGreen))
+            .fill(Color(NSColor.tertiaryLabelColor))
             .frame(width: 7, height: 7)
             .opacity(pulsing ? 0.4 : 1)
             .animation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true), value: pulsing)
@@ -1234,14 +1542,20 @@ struct DirectoryRow: View {
         _isExpanded = State(initialValue: initiallyExpanded)
     }
 
-    private let indentUnit: CGFloat = 16
+    // Chevron, file icon, and each indent cell all share this width so the
+    // whole tree stays on one column grid.
+    private let iconUnit: CGFloat = 16
+    private let rowSpacing: CGFloat = 4
     private var isSelected: Bool { directoryStore.selectedFile?.path == item.path }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .center, spacing: 4) {
-                if depth > 0 {
-                    Spacer().frame(width: CGFloat(depth) * indentUnit)
+            HStack(alignment: .center, spacing: rowSpacing) {
+                // One transparent cell per depth level — same width as the
+                // chevron/icon columns, so it shares the row's spacing and the
+                // tree stays on one grid.
+                ForEach(0..<depth, id: \.self) { _ in
+                    Color.clear.frame(width: iconUnit, height: iconUnit)
                 }
                 Image(systemName: "chevron.right")
                     .fontWeight(.semibold)
@@ -1249,7 +1563,7 @@ struct DirectoryRow: View {
                     .foregroundColor(Color(NSColor.tertiaryLabelColor))
                     .opacity(item.isDirectory ? 1 : 0)
                     .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                    .frame(width: 10)
+                    .frame(width: iconUnit, height: iconUnit)
                 Group {
                     if let icon {
                         Image(nsImage: icon)
@@ -1258,7 +1572,7 @@ struct DirectoryRow: View {
                         Color.clear
                     }
                 }
-                .frame(width: 16, height: 16)
+                .frame(width: iconUnit, height: iconUnit)
                 Text(item.name)
                     .font(.callout)
                     .lineLimit(1)

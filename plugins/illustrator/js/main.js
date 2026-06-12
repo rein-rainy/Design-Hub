@@ -1,7 +1,11 @@
 // Design Hub — Illustrator CEP panel script.
-// Polls the host (ExtendScript) for document state, detects open/save/close,
-// and forwards snapshots to the macOS app over WebSocket — same protocol the
-// Photoshop UXP plugin uses.
+// Forwards document snapshots to the macOS app over WebSocket — same protocol
+// the Photoshop UXP plugin uses.
+//
+// Save detection lives in the macOS app (it watches the .ai file on disk and
+// sends `request_save_snapshot`), so the panel only polls the host for
+// open/close detection — slowly, because every evalScript runs on
+// Illustrator's main thread and frequent calls disrupt the user's tools.
 
 var cs = new CSInterface();
 
@@ -27,6 +31,13 @@ var bridge = (function () {
         if (onStatusChange) onStatusChange('connected');
         var pending = queue.splice(0);
         for (var i = 0; i < pending.length; i++) ws.send(JSON.stringify(pending[i]));
+        // The app may have (re)started after Illustrator and knows nothing
+        // about the documents already open. Forget our diff state and poll
+        // immediately so document_opened is re-sent for the active doc.
+        lastOpen = false;
+        lastPath = '';
+        knownDocs = [];
+        poll();
       };
 
       ws.onclose = function () {
@@ -82,8 +93,12 @@ bridge.setStatusHandler(function (status) {
 });
 
 bridge.setMessageHandler(function (msg) {
+  if (!msg) return;
   // Auto-save: save the document to disk first, then snapshot.
-  if (msg && msg.type === 'request_snapshot') sendSnapshot('snapshot_requested', 'dhSaveAndSnapshot');
+  if (msg.type === 'request_snapshot') sendSnapshot('snapshot_requested', 'dhSaveAndSnapshot');
+  // The app saw the .ai file change on disk — the user just saved, so only
+  // a snapshot is needed (saving again here would disturb the user).
+  if (msg.type === 'request_save_snapshot') sendSnapshot('document_saved');
 });
 
 // ── Snapshot ─────────────────────────────────────────────────────────────────
@@ -105,22 +120,17 @@ function sendSnapshot(eventType, hostFn) {
     try { payload = JSON.parse(res); } catch (e) { return; }
     bridge.send(envelope(eventType, payload));
     lastEvent.textContent = eventType + ' · ' + new Date().toLocaleTimeString();
-    // After a programmatic auto-save the doc is now clean; sync the poll state
-    // so the next poll doesn't read it as a user-initiated dirty→saved save.
-    if (hostFn === 'dhSaveAndSnapshot') {
-      lastSaved = true;
-      if (payload.path) lastPath = payload.path;
-      if (payload.name) lastName = payload.name;
-    }
   });
 }
 
-// ── Open / save / close detection (poll the host) ─────────────────────────────
+// ── Open / close detection (poll the host) ───────────────────────────────────
+// Saves are detected by the macOS app watching the file on disk; this poll only
+// notices documents opening, closing, and switching, so it can run rarely.
 
-var lastOpen  = false;
-var lastPath  = '';
-var lastSaved = true;
-var lastName  = '';
+var POLL_INTERVAL_MS = 30000;
+
+var lastOpen = false;
+var lastPath = '';
 
 // Snapshot of every open document, used to emit document_closed for any that
 // disappear — covers closing one of several docs and switching the active doc.
@@ -131,38 +141,29 @@ function docKey(d) {
 }
 
 function poll() {
-  // (1) Active-doc open/save detection (drives the commit panel).
-  cs.evalScript('dhSaveState()', function (res) {
+  // One evalScript per tick: each call runs on Illustrator's main thread.
+  cs.evalScript('dhPollState()', function (res) {
     var st;
     try { st = JSON.parse(res); } catch (e) { return; }
 
+    // (1) Active-doc open detection (drives "Now Editing").
     if (st.open) {
       if (!lastOpen || st.path !== lastPath) {
         // A different document is now active (or the first one opened).
-        // An untitled doc just saved-as (lastPath "" → real path) counts as a save.
+        // An untitled doc just saved-as (lastPath "" → real path) counts as a
+        // save — it also tells the app which new file to start watching.
         var ev = (lastOpen && lastPath === '' && st.path !== '') ? 'document_saved' : 'document_opened';
         if (ev === 'document_opened' || st.path !== '') sendSnapshot(ev);
-      } else if (st.saved && !lastSaved && st.path !== '') {
-        // Unsaved → saved transition: the user saved the document.
-        sendSnapshot('document_saved');
       }
       lastOpen = true;
       lastPath = st.path;
-      lastSaved = st.saved;
-      lastName = st.name;
     } else {
       lastOpen = false;
       lastPath = '';
-      lastSaved = true;
-      lastName = '';
     }
-  });
 
-  // (2) Reconcile the full open set so closed docs leave "Now Editing".
-  cs.evalScript('dhOpenDocs()', function (res) {
-    var docs;
-    try { docs = JSON.parse(res); } catch (e) { return; }
-
+    // (2) Reconcile the full open set so closed docs leave "Now Editing".
+    var docs = st.docs || [];
     for (var i = 0; i < knownDocs.length; i++) {
       var prev = knownDocs[i];
       var stillOpen = false;
@@ -183,5 +184,5 @@ function poll() {
 }
 
 bridge.start();
-setInterval(poll, 1500);
+setInterval(poll, POLL_INTERVAL_MS);
 poll();

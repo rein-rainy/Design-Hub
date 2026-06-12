@@ -28,6 +28,14 @@ struct DocumentPayload: Codable, Equatable {
     let layerCount: Int
     let topLevelLayerCount: Int
     let layerTree: [LayerNode]
+    // Illustrator only — total shape (pageItem) count, nil for Photoshop messages.
+    // Drives the heatmap/diff because AI work changes shapes far more than layers.
+    let shapeCount: Int?
+    // Illustrator only — uuid of every pageItem, so commits can be diffed into
+    // "+N added / -N removed" shapes instead of a net count change. May be
+    // shorter than shapeCount on Illustrator versions without pageItem.uuid;
+    // consumers must treat that as "no identity data" and fall back.
+    let shapeIds: [String]?
     // Illustrator only — nil for Photoshop messages
     let artboardCount: Int?
     let artboardNames: [String]?
@@ -55,5 +63,9 @@ struct PluginCommand: Encodable {
 
     enum CommandType: String, Encodable {
         case requestSnapshot = "request_snapshot"
+        // Sent when DocumentSaveWatcher sees the file change on disk: the user
+        // already saved, so the plugin replies with a `document_saved` snapshot
+        // without saving again.
+        case requestSaveSnapshot = "request_save_snapshot"
     }
 }

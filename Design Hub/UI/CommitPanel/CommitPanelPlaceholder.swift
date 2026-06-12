@@ -3,6 +3,7 @@ import SwiftUI
 struct CommitPanelPlaceholder: View {
     let message: PluginMessage
     let layerDiff: LayerDiff?
+    var shapeChange: ShapeChange? = nil
     let onCommit: (String) -> Void
     let onCancel: () -> Void
 
@@ -34,17 +35,16 @@ struct CommitPanelPlaceholder: View {
                             .font(.body)
                             .foregroundStyle(Color(NSColor.labelColor))
                         Spacer()
-                        if let diff = layerDiff, !diff.isEmpty {
-                            if diff.added.count > 0 {
-                                Text("+\(diff.added.count)")
-                                    .font(.callout)
-                                    .foregroundStyle(Color(NSColor.systemGreen))
-                            }
-                            if diff.removed.count > 0 {
-                                Text("-\(diff.removed.count)")
-                                    .font(.callout)
-                                    .foregroundStyle(Color(NSColor.systemRed))
-                            }
+                        let badge = ChangeBadge.counts(shapeChange: shapeChange, layerDiff: layerDiff)
+                        if badge.added > 0 {
+                            Text("+\(badge.added)")
+                                .font(.callout)
+                                .foregroundStyle(Color(NSColor.systemGreen))
+                        }
+                        if badge.removed > 0 {
+                            Text("-\(badge.removed)")
+                                .font(.callout)
+                                .foregroundStyle(Color(NSColor.systemRed))
                         }
                     }
                     .padding(15)

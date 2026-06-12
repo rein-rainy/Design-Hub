@@ -13,10 +13,12 @@ final class AppCoordinator {
                 guard let store else { return }
                 if let message {
                     let diff = store.layerDiff(for: message)
+                    let shapeChange = store.shapeChange(for: message)
                     CommitPanelController.shared.show(
                         rootView: CommitPanelPlaceholder(
                             message: message,
                             layerDiff: diff,
+                            shapeChange: shapeChange,
                             onCommit: { msg in
                                 Task { @MainActor in store.confirmCommit(commitMessage: msg) }
                             },

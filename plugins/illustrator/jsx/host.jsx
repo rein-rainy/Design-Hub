@@ -34,7 +34,9 @@ function dhLayerJSON(layer) {
         }
     } catch (e3) {}
 
-    return '{"id":0'
+    // Illustrator exposes no stable layer IDs — send null so the app's differ
+    // falls back to name-based identity (id:0 would make every layer identical).
+    return '{"id":null'
         + ',"name":"' + dhEscape(layer.name) + '"'
         + ',"visible":' + (visible ? 'true' : 'false')
         + ',"locked":' + (locked ? 'true' : 'false')
@@ -70,11 +72,32 @@ function dhSnapshot() {
         }
     } catch (e2) {}
 
+    // Shape (pageItem) count drives the heatmap/diff for Illustrator: AI work
+    // adds/removes shapes far more often than whole layers. `doc.pageItems`
+    // is a flat collection of every page item across all layers *and* inside
+    // groups, so its length is the document's total shape count.
+    //
+    // Each item's uuid (Illustrator 24+) is also collected so the app can tell
+    // "3 added, 2 removed" apart from a net count change of +1. If uuids are
+    // unavailable the list comes back short and the app falls back to the net
+    // count delta.
+    var shapeCount = 0;
+    var shapeIds = [];
+    try {
+        var items = doc.pageItems;
+        shapeCount = items.length;
+        for (var s = 0; s < shapeCount; s++) {
+            try { shapeIds.push('"' + dhEscape(String(items[s].uuid)) + '"'); } catch (eId) {}
+        }
+    } catch (eShapes) {}
+
     return '{'
         + '"path":"' + dhEscape(path) + '"'
         + ',"name":"' + dhEscape(doc.name) + '"'
         + ',"layerCount":' + dhCountLayers(doc.layers)
         + ',"topLevelLayerCount":' + doc.layers.length
+        + ',"shapeCount":' + shapeCount
+        + ',"shapeIds":[' + shapeIds.join(',') + ']'
         + ',"layerTree":[' + layerJSONs.join(',') + ']'
         + ',"artboardCount":' + abNames.length
         + ',"artboardNames":[' + abNames.join(',') + ']'
@@ -118,18 +141,19 @@ function dhOpenDocs() {
     return '[' + out.join(',') + ']';
 }
 
-// Lightweight state used by the panel to detect open / save / close transitions.
-function dhSaveState() {
+// Lightweight state used by the panel to detect open / close transitions.
+// Combines the active-doc state and the full open set into one call, because
+// every evalScript round-trip runs on Illustrator's main thread.
+function dhPollState() {
+    var docsJSON = dhOpenDocs();
     if (app.documents.length === 0) {
-        return '{"open":false,"saved":true,"path":"","name":""}';
+        return '{"open":false,"path":"","name":"","docs":' + docsJSON + '}';
     }
     var doc = app.activeDocument;
     var path = "";
     try { path = doc.fullName.fsName; } catch (e) { path = ""; }
-    var saved = true;
-    try { saved = doc.saved; } catch (e2) {}
     return '{"open":true'
-        + ',"saved":' + (saved ? 'true' : 'false')
         + ',"path":"' + dhEscape(path) + '"'
-        + ',"name":"' + dhEscape(doc.name) + '"}';
+        + ',"name":"' + dhEscape(doc.name) + '"'
+        + ',"docs":' + docsJSON + '}';
 }

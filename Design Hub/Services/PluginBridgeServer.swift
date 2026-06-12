@@ -91,6 +91,11 @@ final class PluginBridgeServer: ObservableObject {
         broadcast(data)
     }
 
+    func requestSaveSnapshot() {
+        guard let data = try? encoder.encode(PluginCommand(type: .requestSaveSnapshot)) else { return }
+        broadcast(data)
+    }
+
     // MARK: - Private
 
     private func accept(_ connection: NWConnection) {

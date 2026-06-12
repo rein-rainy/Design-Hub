@@ -57,13 +57,16 @@ final class CommitRepository {
                       isAutosave: Bool = false) {
         let treeJSON = (try? encoder.encode(message.payload.layerTree))
             .flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        let shapeIdsJSON = message.payload.shapeIds
+            .flatMap { try? encoder.encode($0) }
+            .flatMap { String(data: $0, encoding: .utf8) }
 
         try? db.run(
             """
             INSERT INTO commits
               (id, project_id, timestamp, layer_count, top_level_layer_count,
-               artboard_count, layer_tree, is_autosave, message, backup_path, thumbnail_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               artboard_count, shape_count, shape_ids, layer_tree, is_autosave, message, backup_path, thumbnail_path)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 .text(commitID),
@@ -72,6 +75,8 @@ final class CommitRepository {
                 .integer(Int64(message.payload.layerCount)),
                 .integer(Int64(message.payload.topLevelLayerCount)),
                 message.payload.artboardCount.map { .integer(Int64($0)) } ?? .null,
+                message.payload.shapeCount.map { .integer(Int64($0)) } ?? .null,
+                shapeIdsJSON.map { .text($0) } ?? .null,
                 .text(treeJSON),
                 .integer(isAutosave ? 1 : 0),
                 .text(commitMessage),
@@ -81,11 +86,40 @@ final class CommitRepository {
         )
     }
 
+    /// Deletes auto-save commits older than `cutoff` and returns the rows that
+    /// were removed, so the caller can clean up their backup/thumbnail files.
+    /// Manual commits are never touched.
+    func deleteExpiredAutosaves(olderThan cutoff: Date) -> [Commit] {
+        let cutoffTS = Int64(cutoff.timeIntervalSince1970)
+        let rows = (try? db.query(
+            "SELECT * FROM commits WHERE is_autosave = 1 AND timestamp < ?",
+            [.integer(cutoffTS)]
+        )) ?? []
+        let expired = rows.compactMap { makeCommit(from: $0) }
+        guard !expired.isEmpty else { return [] }
+        try? db.run(
+            "DELETE FROM commits WHERE is_autosave = 1 AND timestamp < ?",
+            [.integer(cutoffTS)]
+        )
+        return expired
+    }
+
     func setThumbnail(commitID: String, path: String) {
         try? db.run(
             "UPDATE commits SET thumbnail_path = ? WHERE id = ?",
             [.text(path), .text(commitID)]
         )
+    }
+
+    func updateMessage(commitID: String, message: String) {
+        try? db.run(
+            "UPDATE commits SET message = ? WHERE id = ?",
+            [.text(message), .text(commitID)]
+        )
+    }
+
+    func deleteCommit(commitID: String) {
+        try? db.run("DELETE FROM commits WHERE id = ?", [.text(commitID)])
     }
 
     // MARK: - Schema
@@ -106,6 +140,8 @@ final class CommitRepository {
                 layer_count           INTEGER NOT NULL,
                 top_level_layer_count INTEGER NOT NULL,
                 artboard_count        INTEGER,
+                shape_count           INTEGER,
+                shape_ids             TEXT,
                 layer_tree            TEXT NOT NULL DEFAULT '[]',
                 is_autosave           INTEGER NOT NULL DEFAULT 1,
                 message               TEXT NOT NULL DEFAULT '',
@@ -123,6 +159,12 @@ final class CommitRepository {
         }
         if !existing.contains("thumbnail_path") {
             try? db.exec("ALTER TABLE commits ADD COLUMN thumbnail_path TEXT")
+        }
+        if !existing.contains("shape_count") {
+            try? db.exec("ALTER TABLE commits ADD COLUMN shape_count INTEGER")
+        }
+        if !existing.contains("shape_ids") {
+            try? db.exec("ALTER TABLE commits ADD COLUMN shape_ids TEXT")
         }
     }
 
@@ -153,6 +195,8 @@ final class CommitRepository {
         else { return nil }
 
         let tree = (try? decoder.decode([LayerNode].self, from: Data(treeJSON.utf8))) ?? []
+        let shapeIds = row["shape_ids"]?.string
+            .flatMap { try? decoder.decode([String].self, from: Data($0.utf8)) }
 
         return Commit(
             id: id,
@@ -161,6 +205,8 @@ final class CommitRepository {
             layerCount: layers,
             topLevelLayerCount: topLayers,
             artboardCount: row["artboard_count"]?.int,
+            shapeCount: row["shape_count"]?.int,
+            shapeIds: shapeIds,
             layerTree: tree,
             isAutosave: isAutosave == 1,
             message: row["message"]?.string ?? "",
